@@ -1,6 +1,6 @@
 [package]
 name = "hnsw"
-version = "0.11.1-alpha.0"
+version = "0.12.0-alpha.0"
 authors = ["Geordon Worley <vadixidav@gmail.com>"]
 edition = "2018"
 description = "Fast approximate nearest neighbors"
@@ -12,7 +12,7 @@ license = "MIT"
 readme = "README.md"
 
 [features]
-serde1 = ["smallvec/serde", "serde"]
+serde1 = ["serde"]
 
 [[bench]]
 name = "benches"
@@ -24,7 +24,6 @@ rand_core = "0.6.3"
 hashbrown = "0.11.2"
 serde = { version = "1.0.126", default-features = false, features = ["derive"], optional = true }
 libm = "0.2.1"
-smallvec = { version = "1.6.1", features = ["const_generics"] }
 ahash = { version = "0.7.4", default-features = false }
 num-traits = { version = "0.2.14", default-features = false }
 

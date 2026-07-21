@@ -35,6 +35,13 @@ pub struct Hnsw<Met, T, R, const M: usize, const M0: usize> {
     prng: R,
     /// The parameters for the HNSW.
     params: Params,
+    /// Soft-delete tombstones indexed by zero-node id: `deleted[id] == true`
+    /// means node `id` is logically removed. This is DERIVED state — it is
+    /// `#[serde(skip)]` so the on-disk snapshot format is unchanged, and the
+    /// owner (immutlex) re-applies tombstones on load from its id maps via
+    /// [`Hnsw::mark_delete`]. Grown lazily; reads past its end are live.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    deleted: Vec<bool>,
 }
 
 impl<Met, T, R, const M: usize, const M0: usize> Hnsw<Met, T, R, M, M0>
@@ -50,6 +57,7 @@ where
             layers: vec![],
             prng: R::from_seed(R::Seed::default()),
             params: Params::new(),
+            deleted: vec![],
         }
     }
 
@@ -62,6 +70,7 @@ where
             layers: vec![],
             prng: R::from_seed(R::Seed::default()),
             params,
+            deleted: vec![],
         }
     }
 
@@ -73,6 +82,7 @@ where
             layers: vec![],
             prng: R::from_seed(R::Seed::default()),
             params,
+            deleted: vec![],
         }
     }
 }
@@ -128,6 +138,7 @@ where
             layers: vec![],
             prng,
             params: Default::default(),
+            deleted: vec![],
         }
     }
 
@@ -140,6 +151,7 @@ where
             layers: vec![],
             prng,
             params,
+            deleted: vec![],
         }
     }
 
@@ -277,6 +289,44 @@ where
         self.zero.is_empty()
     }
 
+    /// Number of live (non-deleted) nodes in the index.
+    pub fn live_count(&self) -> usize {
+        self.zero.len() - self.deleted.iter().filter(|&&d| d).count()
+    }
+
+    /// Returns whether zero-node `id` has been soft-deleted.
+    #[inline]
+    pub fn is_deleted(&self, id: usize) -> bool {
+        self.deleted.get(id).copied().unwrap_or(false)
+    }
+
+    /// Soft-deletes zero-node `id`: it is excluded from search results but its
+    /// slot and edges remain in the graph so navigation stays connected until an
+    /// exact rebuild (compaction) reclaims it. Idempotent.
+    pub fn mark_delete(&mut self, id: usize) {
+        if id >= self.deleted.len() {
+            self.deleted.resize(id + 1, false);
+        }
+        self.deleted[id] = true;
+    }
+
+    /// The zero-node id of the current live navigation entry point, or `None`
+    /// if the index has no live nodes. Scans the towers top-down and returns the
+    /// first live node, so a deleted entry point is transparently skipped.
+    pub fn entry(&self) -> Option<usize> {
+        if self.zero.is_empty() {
+            return None;
+        }
+        for layer in self.layers.iter().rev() {
+            for node in layer {
+                if !self.is_deleted(node.zero_node) {
+                    return Some(node.zero_node);
+                }
+            }
+        }
+        (0..self.zero.len()).find(|&id| !self.is_deleted(id))
+    }
+
     pub fn layer_is_empty(&self, level: usize) -> bool {
         self.layer_len(level) == 0
     }
@@ -317,6 +367,12 @@ where
         // search the zero layer
         self.search_zero_layer(q, searcher, cap);
 
+        // The zero-layer search excludes soft-deleted nodes from the result
+        // heap, but `lower_search` may have seeded `nearest` with a deleted node
+        // when descending from the upper layers. Drop those so a tombstone can
+        // never surface as a result.
+        searcher.nearest.retain(|n| !self.is_deleted(n.index));
+
         let found = core::cmp::min(dest.len(), searcher.nearest.len());
         dest[..found].copy_from_slice(&searcher.nearest[..found]);
         &mut dest[..found]
@@ -349,6 +405,18 @@ where
                     let distance = self
                         .metric
                         .distance(q, &self.features[node_to_visit as usize]);
+                    // At the zero (result) layer a soft-deleted node is still
+                    // traversed — so live nodes reachable only through it stay
+                    // reachable — but it must NEVER enter the result heap nor
+                    // consume the `cap` budget, otherwise the result set
+                    // under-fills with live neighbors crowded out by tombstones.
+                    if matches!(layer, Layer::Zero) && self.is_deleted(node_to_visit) {
+                        searcher.candidates.push(Neighbor {
+                            index: neighbor as usize,
+                            distance,
+                        });
+                        continue;
+                    }
                     // Attempt to insert into nearest queue.
                     let pos = searcher.nearest.partition_point(|n| n.distance <= distance);
                     if pos != cap {

@@ -1,0 +1,448 @@
+use super::nodes::Layer;
+use crate::*;
+use alloc::{vec, vec::Vec};
+use rand_core::{RngCore, SeedableRng};
+use space::{Metric, Neighbor};
+
+/// Sentinel for an empty neighbor slot (mirrors the const-generic `!0` fill).
+const EMPTY: usize = !0;
+
+/// A non-zero-layer node in the runtime-degree HNSW.
+///
+/// Structurally identical to the const-generic [`crate::Node`] except the
+/// neighbor list is a heap `Vec<usize>` of runtime length `m` (fixed at
+/// construction, `EMPTY`-padded) instead of a `[usize; M]` array.
+#[derive(Clone, Debug)]
+struct RuntimeNode {
+    zero_node: usize,
+    next_node: usize,
+    /// Length == `m`, `EMPTY`-padded. Live neighbors are the leading run of
+    /// non-`EMPTY` entries.
+    neighbors: Vec<usize>,
+}
+
+/// Live neighbors = the leading run of non-`EMPTY` entries (mirrors
+/// `NeighborNodes::get_neighbors`'s `take_while(|&n| n != !0)`).
+fn live_neighbors(slice: &[usize]) -> impl Iterator<Item = usize> + '_ {
+    slice.iter().copied().take_while(|&n| n != EMPTY)
+}
+
+/// Runtime-degree HNSW: behaviorally identical to
+/// [`crate::Hnsw`]`<Met, T, R, M, M0>` but with the graph out-degrees `M`
+/// (upper layers) and `M0` (zero layer) chosen at RUNTIME rather than as
+/// compile-time const generics.
+///
+/// # Why this exists
+///
+/// The const-generic [`crate::Hnsw`] bakes `M`/`M0` into the type, which is the
+/// right call for a persisted index (the on-disk snapshot format embeds the
+/// concrete type). But an operator-configured, transient, non-persisted index
+/// cannot monomorphize over an arbitrary runtime `M` without an enum-dispatch
+/// whitelist of fixed values. This type stores the degrees as `usize` fields
+/// and sizes its neighbor `Vec`s accordingly, so any `m >= 2` (`m0 >= m`) is
+/// supported with no fixed set of allowed values.
+///
+/// Given the SAME `(m, m0)`, the SAME seeded PRNG, and the SAME insertion order,
+/// this produces byte-identical construction + search results to
+/// `Hnsw<_, _, _, M, M0>`; see `tests/runtime_parity.rs`.
+#[derive(Clone)]
+pub struct HnswRuntime<Met, T, R> {
+    metric: Met,
+    /// Upper-layer out-degree (the const-generic `M`).
+    m: usize,
+    /// Zero-layer out-degree (the const-generic `M0`).
+    m0: usize,
+    /// Zero-layer neighbor lists. Each entry has length `m0`, `EMPTY`-padded.
+    zero: Vec<Vec<usize>>,
+    /// Zero-layer features, indexed by zero-node id.
+    features: Vec<T>,
+    /// Non-zero layers.
+    layers: Vec<Vec<RuntimeNode>>,
+    prng: R,
+    params: Params,
+}
+
+impl<Met, T, R> HnswRuntime<Met, T, R>
+where
+    R: RngCore + SeedableRng,
+{
+    /// Creates a runtime-degree HNSW with a default-seeded deterministic PRNG.
+    ///
+    /// # Panics
+    /// Panics if `m < 2` or `m0 < m` (checked topology guardrails, not tuning
+    /// defaults): `m < 2` cannot form a navigable graph and the level
+    /// distribution `1/ln(m)` is undefined at `m == 1`; the zero layer must be
+    /// at least as connected as the upper layers.
+    pub fn new(metric: Met, m: usize, m0: usize) -> Self {
+        Self::new_params_and_prng(
+            metric,
+            m,
+            m0,
+            Params::new(),
+            R::from_seed(R::Seed::default()),
+        )
+    }
+
+    /// Creates a runtime-degree HNSW with the specified params and a
+    /// default-seeded PRNG.
+    pub fn new_params(metric: Met, m: usize, m0: usize, params: Params) -> Self {
+        Self::new_params_and_prng(metric, m, m0, params, R::from_seed(R::Seed::default()))
+    }
+}
+
+impl<Met, T, R> HnswRuntime<Met, T, R>
+where
+    R: RngCore,
+{
+    /// Creates a runtime-degree HNSW with the passed `prng`.
+    pub fn new_prng(metric: Met, m: usize, m0: usize, prng: R) -> Self {
+        Self::new_params_and_prng(metric, m, m0, Params::default(), prng)
+    }
+
+    /// Creates a runtime-degree HNSW with the passed `params` and `prng`.
+    ///
+    /// # Panics
+    /// See [`Self::new`] for the `m`/`m0` guardrails.
+    pub fn new_params_and_prng(metric: Met, m: usize, m0: usize, params: Params, prng: R) -> Self {
+        assert!(m >= 2, "HnswRuntime requires m >= 2, got {}", m);
+        assert!(
+            m0 >= m,
+            "HnswRuntime requires m0 >= m, got m0={} m={}",
+            m0,
+            m
+        );
+        Self {
+            metric,
+            m,
+            m0,
+            zero: vec![],
+            features: vec![],
+            layers: vec![],
+            prng,
+            params,
+        }
+    }
+
+    /// Upper-layer out-degree (`M`).
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Zero-layer out-degree (`M0`).
+    pub fn m0(&self) -> usize {
+        self.m0
+    }
+
+    pub fn len(&self) -> usize {
+        self.zero.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.zero.is_empty()
+    }
+
+    pub fn layers(&self) -> usize {
+        self.layers.len() + 1
+    }
+
+    /// Extract the feature for a given item returned by [`Self::nearest`].
+    pub fn feature(&self, item: usize) -> &T {
+        &self.features[item]
+    }
+}
+
+impl<Met, T, R> HnswRuntime<Met, T, R>
+where
+    R: RngCore,
+    Met: Metric<T>,
+{
+    /// Inserts a feature into the HNSW. Mirrors [`crate::Hnsw::insert`].
+    pub fn insert(&mut self, q: T, searcher: &mut Searcher<Met::Unit>) -> usize {
+        let level = self.random_level();
+        let mut cap = if level >= self.layers.len() {
+            self.params.ef_construction
+        } else {
+            1
+        };
+
+        if self.is_empty() {
+            self.zero.push(vec![EMPTY; self.m0]);
+            self.features.push(q);
+            while self.layers.len() < level {
+                let node = RuntimeNode {
+                    zero_node: 0,
+                    next_node: 0,
+                    neighbors: vec![EMPTY; self.m],
+                };
+                self.layers.push(vec![node]);
+            }
+            return 0;
+        }
+
+        self.initialize_searcher(&q, searcher);
+
+        for ix in (level..self.layers.len()).rev() {
+            self.search_single_layer(&q, searcher, Layer::NonZero(&self.layers[ix]), cap);
+            Self::lower_search(&self.layers[ix], searcher);
+            cap = if ix == level {
+                self.params.ef_construction
+            } else {
+                1
+            };
+        }
+
+        for ix in (0..core::cmp::min(level, self.layers.len())).rev() {
+            self.search_single_layer(&q, searcher, Layer::NonZero(&self.layers[ix]), cap);
+            self.create_node(&q, &searcher.nearest, ix + 1);
+            Self::lower_search(&self.layers[ix], searcher);
+            cap = self.params.ef_construction;
+        }
+
+        self.search_zero_layer(&q, searcher, cap);
+        self.create_node(&q, &searcher.nearest, 0);
+        self.features.push(q);
+
+        let zero_node = self.zero.len() - 1;
+        while self.layers.len() < level {
+            let node = RuntimeNode {
+                zero_node,
+                next_node: self.layers.last().map(|l| l.len() - 1).unwrap_or(zero_node),
+                neighbors: vec![EMPTY; self.m],
+            };
+            self.layers.push(vec![node]);
+        }
+        zero_node
+    }
+
+    /// k-NN search. Mirrors [`crate::Hnsw::nearest`].
+    pub fn nearest<'a>(
+        &self,
+        q: &T,
+        ef: usize,
+        searcher: &mut Searcher<Met::Unit>,
+        dest: &'a mut [Neighbor<Met::Unit>],
+    ) -> &'a mut [Neighbor<Met::Unit>] {
+        self.search_layer(q, ef, 0, searcher, dest)
+    }
+
+    /// Mirrors [`crate::Hnsw::search_layer`].
+    pub fn search_layer<'a>(
+        &self,
+        q: &T,
+        ef: usize,
+        level: usize,
+        searcher: &mut Searcher<Met::Unit>,
+        dest: &'a mut [Neighbor<Met::Unit>],
+    ) -> &'a mut [Neighbor<Met::Unit>] {
+        if self.features.is_empty() || level >= self.layers() {
+            return &mut [];
+        }
+
+        self.initialize_searcher(q, searcher);
+        let cap = 1;
+
+        for (ix, layer) in self.layers.iter().enumerate().rev() {
+            self.search_single_layer(q, searcher, Layer::NonZero(layer), cap);
+            if ix + 1 == level {
+                let found = core::cmp::min(dest.len(), searcher.nearest.len());
+                dest[..found].copy_from_slice(&searcher.nearest[..found]);
+                return &mut dest[..found];
+            }
+            Self::lower_search(layer, searcher);
+        }
+
+        let cap = ef;
+        self.search_zero_layer(q, searcher, cap);
+
+        let found = core::cmp::min(dest.len(), searcher.nearest.len());
+        dest[..found].copy_from_slice(&searcher.nearest[..found]);
+        &mut dest[..found]
+    }
+
+    /// Mirrors [`crate::Hnsw::search_single_layer`].
+    fn search_single_layer(
+        &self,
+        q: &T,
+        searcher: &mut Searcher<Met::Unit>,
+        layer: Layer<&[RuntimeNode]>,
+        cap: usize,
+    ) {
+        while let Some(Neighbor { index, .. }) = searcher.candidates.pop() {
+            let raw_neighbors: &[usize] = match layer {
+                Layer::NonZero(layer) => &layer[index].neighbors,
+                Layer::Zero => &self.zero[index],
+            };
+            for neighbor in live_neighbors(raw_neighbors) {
+                let node_to_visit = match layer {
+                    Layer::NonZero(layer) => layer[neighbor].zero_node,
+                    Layer::Zero => neighbor,
+                };
+                if searcher.seen.insert(node_to_visit) {
+                    let distance = self.metric.distance(q, &self.features[node_to_visit]);
+                    let pos = searcher.nearest.partition_point(|n| n.distance <= distance);
+                    if pos != cap {
+                        if searcher.nearest.len() == cap {
+                            searcher.nearest.pop();
+                        }
+                        let candidate = Neighbor {
+                            index: neighbor,
+                            distance,
+                        };
+                        searcher.nearest.insert(pos, candidate);
+                        searcher.candidates.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    fn search_zero_layer(&self, q: &T, searcher: &mut Searcher<Met::Unit>, cap: usize) {
+        self.search_single_layer(q, searcher, Layer::Zero, cap);
+    }
+
+    /// Mirrors [`crate::Hnsw::lower_search`].
+    fn lower_search(layer: &[RuntimeNode], searcher: &mut Searcher<Met::Unit>) {
+        searcher.candidates.clear();
+        let &Neighbor { index, distance } = searcher.nearest.first().unwrap();
+        searcher.nearest.clear();
+        searcher.seen.clear();
+        let new_index = layer[index].next_node;
+        let candidate = Neighbor {
+            index: new_index,
+            distance,
+        };
+        searcher.seen.insert(layer[index].zero_node);
+        searcher.nearest.push(candidate);
+        searcher.candidates.push(candidate);
+    }
+
+    /// Mirrors [`crate::Hnsw::initialize_searcher`].
+    fn initialize_searcher(&self, q: &T, searcher: &mut Searcher<Met::Unit>) {
+        searcher.clear();
+        let entry_distance = self.metric.distance(q, self.entry_feature());
+        let candidate = Neighbor {
+            index: 0,
+            distance: entry_distance,
+        };
+        searcher.candidates.push(candidate);
+        searcher.nearest.push(candidate);
+        searcher.seen.insert(
+            self.layers
+                .last()
+                .map(|layer| layer[0].zero_node)
+                .unwrap_or(0),
+        );
+    }
+
+    fn entry_feature(&self) -> &T {
+        if let Some(last_layer) = self.layers.last() {
+            &self.features[last_layer[0].zero_node]
+        } else {
+            &self.features[0]
+        }
+    }
+
+    /// Mirrors [`crate::Hnsw::random_level`], using the runtime `m`.
+    fn random_level(&mut self) -> usize {
+        let uniform: f64 = self.prng.next_u64() as f64 / u64::MAX as f64;
+        (-libm::log(uniform) * libm::log(self.m as f64).recip()) as usize
+    }
+
+    /// Mirrors [`crate::Hnsw::create_node`].
+    fn create_node(&mut self, q: &T, nearest: &[Neighbor<Met::Unit>], layer: usize) {
+        if layer == 0 {
+            let new_index = self.zero.len();
+            let mut neighbors = vec![EMPTY; self.m0];
+            for (d, s) in neighbors.iter_mut().zip(nearest.iter()) {
+                *d = s.index;
+            }
+            let live: Vec<usize> = live_neighbors(&neighbors).collect();
+            for neighbor in live {
+                self.add_neighbor(q, new_index, neighbor, layer);
+            }
+            self.zero.push(neighbors);
+        } else {
+            let new_index = self.layers[layer - 1].len();
+            let mut neighbors = vec![EMPTY; self.m];
+            for (d, s) in neighbors.iter_mut().zip(nearest.iter()) {
+                *d = s.index;
+            }
+            let node = RuntimeNode {
+                zero_node: self.zero.len(),
+                next_node: if layer == 1 {
+                    self.zero.len()
+                } else {
+                    self.layers[layer - 2].len()
+                },
+                neighbors,
+            };
+            let live: Vec<usize> = live_neighbors(&node.neighbors).collect();
+            for neighbor in live {
+                self.add_neighbor(q, new_index, neighbor, layer);
+            }
+            self.layers[layer - 1].push(node);
+        }
+    }
+
+    /// Mirrors [`crate::Hnsw::add_neighbor`].
+    fn add_neighbor(&mut self, q: &T, node_ix: usize, target_ix: usize, layer: usize) {
+        let (target_feature_ix, target_neighbors): (usize, Vec<usize>) = if layer == 0 {
+            (target_ix, self.zero[target_ix].clone())
+        } else {
+            let target = &self.layers[layer - 1][target_ix];
+            (target.zero_node, target.neighbors.clone())
+        };
+        let target_feature = &self.features[target_feature_ix];
+
+        let empty_point = target_neighbors.partition_point(|&n| n != EMPTY);
+        if empty_point != target_neighbors.len() {
+            if layer == 0 {
+                self.zero[target_ix][empty_point] = node_ix;
+            } else {
+                self.layers[layer - 1][target_ix].neighbors[empty_point] = node_ix;
+            }
+        } else {
+            let (worst_ix, worst_distance) = target_neighbors
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, &n)| {
+                    if n == EMPTY {
+                        None
+                    } else {
+                        let feat_ix = if layer == 0 {
+                            n
+                        } else {
+                            self.layers[layer - 1][n].zero_node
+                        };
+                        let distance = self
+                            .metric
+                            .distance(target_feature, &self.features[feat_ix]);
+                        Some((ix, distance))
+                    }
+                })
+                .min_by_key(|&(_, distance)| core::cmp::Reverse(distance))
+                .unwrap();
+
+            if self.metric.distance(q, target_feature) < worst_distance {
+                if layer == 0 {
+                    self.zero[target_ix][worst_ix] = node_ix;
+                } else {
+                    self.layers[layer - 1][target_ix].neighbors[worst_ix] = node_ix;
+                }
+            }
+        }
+    }
+}
+
+impl<Met, T, R> Default for HnswRuntime<Met, T, R>
+where
+    R: RngCore + SeedableRng,
+    Met: Default,
+{
+    /// Default runtime degrees mirror the crate's canonical const-generic
+    /// instantiation (`M = 12`, `M0 = 24`). Callers that need operator-chosen
+    /// degrees use [`Self::new`] / [`Self::new_params_and_prng`].
+    fn default() -> Self {
+        Self::new(Met::default(), 12, 24)
+    }
+}
