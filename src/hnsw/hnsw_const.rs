@@ -2,7 +2,8 @@ use super::feature_store::FeatureStore;
 use super::nodes::{HasNeighbors, Layer};
 use crate::hnsw::nodes::{NeighborNodes, Node};
 use crate::*;
-use alloc::{vec, vec::Vec};
+use alloc::{collections::BinaryHeap, vec, vec::Vec};
+use core::cmp::Reverse;
 use core::marker::PhantomData;
 use num_traits::Zero;
 use rand_core::{RngCore, SeedableRng};
@@ -303,6 +304,51 @@ where
         self.search_layer(q, ef, 0, searcher, dest)
     }
 
+    /// Like [`HNSW::nearest`], but only nodes accepted by `filter` may enter the
+    /// result set.
+    ///
+    /// `filter` is called with zero-layer node ids. The predicate is applied ONLY
+    /// at the zero (result) layer: upper-layer descent is pure navigation and is
+    /// never filtered, and a rejected node remains eligible as a NAVIGATION
+    /// INTERMEDIATE, so accepted nodes behind it can still be reached. It is
+    /// eligible, not guaranteed to be traversed: like any accepted node it must
+    /// still fall within the beam, and the early stop can end the search first.
+    ///
+    /// An `ef` of 0 returns an empty slice.
+    ///
+    /// # Budget semantics
+    ///
+    /// The zero-layer frontier here is a binary min-heap expanded nearest-first,
+    /// and the search stops once the closest remaining candidate is farther than
+    /// the worst of a full result set. This is deliberately NOT the depth-first
+    /// frontier the unfiltered path uses: under a selective predicate the result
+    /// heap fills `1/selectivity` times more slowly, and a depth-first frontier
+    /// then wanders the entire graph.
+    ///
+    /// This is a **distance/beam bound, not a hard work bound**. Work still
+    /// scales roughly as `ef / selectivity`, which is inherent to filtered ANN —
+    /// a beam of `ef` accepted nodes cannot be filled without visiting on the
+    /// order of `ef / selectivity` candidates. A very selective predicate is
+    /// therefore genuinely expensive, and at some point a brute-force scan over
+    /// the accepted set is the better strategy.
+    ///
+    /// # Under-filling
+    ///
+    /// If fewer than `dest.len()` accepted nodes are found, a shorter slice is
+    /// returned. The library deliberately does NOT report whether that was caused
+    /// by the `ef` budget, by too few matching nodes existing, or by graph
+    /// topology, because it cannot distinguish them without further exploration.
+    pub fn nearest_filtered<'a>(
+        &self,
+        q: &T,
+        ef: usize,
+        searcher: &mut Searcher<Met::Unit>,
+        dest: &'a mut [Neighbor<Met::Unit>],
+        filter: &dyn Fn(usize) -> bool,
+    ) -> &'a mut [Neighbor<Met::Unit>] {
+        self.search_zero_layer_filtered(q, ef, searcher, dest, filter)
+    }
+
     /// Extract the feature for a given item returned by [`HNSW::nearest`].
     ///
     /// The `item` must be retrieved from [`HNSW::search_layer`].
@@ -413,6 +459,14 @@ where
             return &mut [];
         }
 
+        // A zero budget must return nothing. The bound below is tested as
+        // `nearest.len() == cap`, which never holds when `cap` is 0, so without
+        // this the result heap grows without limit and a caller asking for no
+        // results gets a full `dest` worth of them after a complete traversal.
+        if ef == 0 {
+            return &mut [];
+        }
+
         self.initialize_searcher(q, searcher);
         let cap = 1;
 
@@ -444,6 +498,145 @@ where
         let found = core::cmp::min(dest.len(), searcher.nearest.len());
         dest[..found].copy_from_slice(&searcher.nearest[..found]);
         &mut dest[..found]
+    }
+
+    /// Zero-layer search with a caller predicate. Backs [`HNSW::nearest_filtered`].
+    ///
+    /// Descent through the upper layers is the unfiltered navigation path; only
+    /// the zero layer consults the predicate.
+    fn search_zero_layer_filtered<'a, F>(
+        &self,
+        q: &T,
+        ef: usize,
+        searcher: &mut Searcher<Met::Unit>,
+        dest: &'a mut [Neighbor<Met::Unit>],
+        filter: &F,
+    ) -> &'a mut [Neighbor<Met::Unit>]
+    where
+        F: Fn(usize) -> bool + ?Sized,
+    {
+        // An ef of 0 has no budget for any result. Without this guard the
+        // seed can survive the scrub below, so the beam never bounds and a
+        // result comes back against a zero budget.
+        if self.features.feature_count() == 0 || ef == 0 {
+            return &mut [];
+        }
+
+        self.initialize_searcher(q, searcher);
+
+        // Upper layers are navigation only and are never filtered.
+        for layer in self.layers.iter().rev() {
+            self.search_single_layer(q, searcher, Layer::NonZero(layer), 1);
+            self.lower_search(layer, searcher);
+        }
+
+        // The seed reaches here unvetted by BOTH exclusion mechanisms — see the
+        // scrub in `search_layer` for why this must happen before the zero-layer
+        // search rather than after it.
+        searcher
+            .nearest
+            .retain(|n| !self.is_deleted(n.index) && filter(n.index));
+
+        self.search_zero_layer_best_first(q, searcher, ef, filter);
+
+        let found = core::cmp::min(dest.len(), searcher.nearest.len());
+        dest[..found].copy_from_slice(&searcher.nearest[..found]);
+        &mut dest[..found]
+    }
+
+    /// Best-first zero-layer traversal with a caller predicate.
+    ///
+    /// The unfiltered search pops `candidates` LIFO, which is depth-first. That
+    /// is cheap when almost every visited node is admissible, because `nearest`
+    /// saturates immediately and the distance gate clamps the frontier. Under a
+    /// selective predicate `nearest` fills `1/selectivity` times more slowly, so
+    /// the gate stays open and a depth-first frontier wanders the whole graph.
+    ///
+    /// This restores the bound the way hnswlib does: always expand the CLOSEST
+    /// candidate, and stop once the closest remaining candidate is farther than
+    /// the worst accepted result while a full set is held. That termination is
+    /// the standard HNSW heuristic, NOT a proof of optimality — a farther graph
+    /// node can lead to a nearer neighbour, which is precisely why this search is
+    /// approximate. On the fixture in `tests/filtered_search.rs` the early stop
+    /// is worth 52.9% of the corpus visited versus 61.3% without it.
+    ///
+    /// The frontier is a real binary min-heap rather than a sorted `Vec`, so a
+    /// push is O(log n) rather than O(n) element movement. That matters
+    /// precisely here: a selective predicate keeps the frontier large for much
+    /// longer than an unfiltered search does, which is the regime where sorted
+    /// insertion would degrade quadratically without any change in the number of
+    /// distance evaluations.
+    ///
+    /// This deliberately does NOT change the unfiltered traversal, which every
+    /// existing caller depends on.
+    fn search_zero_layer_best_first<F>(
+        &self,
+        q: &T,
+        searcher: &mut Searcher<Met::Unit>,
+        ef: usize,
+        filter: &F,
+    ) where
+        F: Fn(usize) -> bool + ?Sized,
+    {
+        // Take the seeds the descent left behind and impose the best-first
+        // invariant the loop relies on. `Reverse` makes the max-heap a min-heap.
+        let mut frontier: BinaryHeap<Reverse<(Met::Unit, usize)>> = searcher
+            .candidates
+            .drain(..)
+            .map(|n| Reverse((n.distance, n.index)))
+            .collect();
+
+        while let Some(Reverse((distance, index))) = frontier.pop() {
+            // Early-stop heuristic: with a full result set, a candidate farther
+            // than the current worst is unlikely to lead anywhere better. This is
+            // standard HNSW termination, not a proof — a farther node can lead to
+            // a nearer neighbour, which is why the search is approximate.
+            if searcher.nearest.len() == ef
+                && let Some(worst) = searcher.nearest.last()
+                && distance > worst.distance
+            {
+                break;
+            }
+
+            for neighbor in self.zero[index].get_neighbors() {
+                if !searcher.seen.insert(neighbor) {
+                    continue;
+                }
+                let distance = self.metric.distance(q, self.features.get_feature(neighbor));
+
+                let admissible = !self.is_deleted(neighbor) && filter(neighbor);
+                let within_beam =
+                    searcher.nearest.partition_point(|n| n.distance <= distance) != ef;
+
+                if admissible {
+                    if !within_beam {
+                        continue;
+                    }
+                    if searcher.nearest.len() == ef {
+                        searcher.nearest.pop();
+                    }
+                    let pos = searcher.nearest.partition_point(|n| n.distance <= distance);
+                    searcher.nearest.insert(
+                        pos,
+                        Neighbor {
+                            index: neighbor,
+                            distance,
+                        },
+                    );
+                } else if !within_beam {
+                    // Excluded AND outside the beam. Keeping it out of the
+                    // frontier is what bounds the frontier's SIZE; it does not
+                    // change the distance-evaluation count, so no work-count test
+                    // can observe it.
+                    continue;
+                }
+
+                // Keep it as a navigation intermediate so accepted nodes behind
+                // it stay eligible to be found — eligible, not guaranteed: it
+                // still competes on distance and the early stop may fire first.
+                frontier.push(Reverse((distance, neighbor)));
+            }
+        }
     }
 
     /// Greedily finds the approximate nearest neighbors to `q` in a non-zero layer.
@@ -580,7 +773,9 @@ where
     /// Generates a correctly distributed random level as per Algorithm 1 line 4 of the paper.
     fn random_level(&mut self) -> usize {
         let uniform: f64 = self.prng.next_u64() as f64 / u64::MAX as f64;
-        (-libm::log(uniform) * libm::log(M as f64).recip()) as usize
+        let scale = self.params.get_level_scale();
+        let level = (-libm::log(uniform) * libm::log(M as f64).recip() * scale) as usize;
+        level.min(crate::MAX_LEVEL)
     }
 
     /// Creates a new node at a layer given its nearest neighbors in that layer.

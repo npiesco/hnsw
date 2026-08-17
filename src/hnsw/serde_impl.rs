@@ -1,8 +1,8 @@
 use crate::hnsw::nodes::NeighborNodes;
 use core::fmt;
 use serde::{
-    de::{Error, Expected, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error, Expected, SeqAccess, Visitor},
 };
 
 impl<const N: usize> Serialize for NeighborNodes<N> {

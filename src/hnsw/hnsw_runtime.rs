@@ -1,7 +1,8 @@
 use super::feature_store::FeatureStore;
 use super::nodes::Layer;
 use crate::*;
-use alloc::{vec, vec::Vec};
+use alloc::{collections::BinaryHeap, vec, vec::Vec};
+use core::cmp::Reverse;
 use core::marker::PhantomData;
 use rand_core::{RngCore, SeedableRng};
 use space::{Metric, Neighbor};
@@ -305,6 +306,117 @@ where
         self.search_layer(q, ef, 0, searcher, dest)
     }
 
+    /// Mirrors [`crate::Hnsw::nearest_filtered`], including its budget and
+    /// under-filling semantics.
+    pub fn nearest_filtered<'a>(
+        &self,
+        q: &T,
+        ef: usize,
+        searcher: &mut Searcher<Met::Unit>,
+        dest: &'a mut [Neighbor<Met::Unit>],
+        filter: &dyn Fn(usize) -> bool,
+    ) -> &'a mut [Neighbor<Met::Unit>] {
+        self.search_zero_layer_filtered(q, ef, searcher, dest, filter)
+    }
+
+    /// Mirrors [`crate::Hnsw::search_zero_layer_filtered`].
+    fn search_zero_layer_filtered<'a, F>(
+        &self,
+        q: &T,
+        ef: usize,
+        searcher: &mut Searcher<Met::Unit>,
+        dest: &'a mut [Neighbor<Met::Unit>],
+        filter: &F,
+    ) -> &'a mut [Neighbor<Met::Unit>]
+    where
+        F: Fn(usize) -> bool + ?Sized,
+    {
+        // An ef of 0 has no budget for any result. Without this guard the
+        // seed can survive the scrub below, so the beam never bounds and a
+        // result comes back against a zero budget.
+        if self.features.feature_count() == 0 || ef == 0 {
+            return &mut [];
+        }
+
+        self.initialize_searcher(q, searcher);
+
+        // Upper layers are navigation only and are never filtered.
+        for layer in self.layers.iter().rev() {
+            self.search_single_layer(q, searcher, Layer::NonZero(layer), 1);
+            Self::lower_search(layer, searcher);
+        }
+
+        searcher
+            .nearest
+            .retain(|n| !self.is_deleted(n.index) && filter(n.index));
+
+        self.search_zero_layer_best_first(q, searcher, ef, filter);
+
+        let found = core::cmp::min(dest.len(), searcher.nearest.len());
+        dest[..found].copy_from_slice(&searcher.nearest[..found]);
+        &mut dest[..found]
+    }
+
+    /// Mirrors [`crate::Hnsw::search_zero_layer_best_first`], including its
+    /// binary-min-heap frontier and early stop.
+    fn search_zero_layer_best_first<F>(
+        &self,
+        q: &T,
+        searcher: &mut Searcher<Met::Unit>,
+        ef: usize,
+        filter: &F,
+    ) where
+        F: Fn(usize) -> bool + ?Sized,
+    {
+        let mut frontier: BinaryHeap<Reverse<(Met::Unit, usize)>> = searcher
+            .candidates
+            .drain(..)
+            .map(|n| Reverse((n.distance, n.index)))
+            .collect();
+
+        while let Some(Reverse((distance, index))) = frontier.pop() {
+            if searcher.nearest.len() == ef
+                && let Some(worst) = searcher.nearest.last()
+                && distance > worst.distance
+            {
+                break;
+            }
+
+            let raw: &[usize] = &self.zero[index];
+            for neighbor in live_neighbors(raw) {
+                if !searcher.seen.insert(neighbor) {
+                    continue;
+                }
+                let distance = self.metric.distance(q, self.features.get_feature(neighbor));
+
+                let admissible = !self.is_deleted(neighbor) && filter(neighbor);
+                let within_beam =
+                    searcher.nearest.partition_point(|n| n.distance <= distance) != ef;
+
+                if admissible {
+                    if !within_beam {
+                        continue;
+                    }
+                    if searcher.nearest.len() == ef {
+                        searcher.nearest.pop();
+                    }
+                    let pos = searcher.nearest.partition_point(|n| n.distance <= distance);
+                    searcher.nearest.insert(
+                        pos,
+                        Neighbor {
+                            index: neighbor,
+                            distance,
+                        },
+                    );
+                } else if !within_beam {
+                    continue;
+                }
+
+                frontier.push(Reverse((distance, neighbor)));
+            }
+        }
+    }
+
     /// Mirrors [`crate::Hnsw::search_layer`].
     pub fn search_layer<'a>(
         &self,
@@ -315,6 +427,11 @@ where
         dest: &'a mut [Neighbor<Met::Unit>],
     ) -> &'a mut [Neighbor<Met::Unit>] {
         if self.features.feature_count() == 0 || level >= self.layers() {
+            return &mut [];
+        }
+
+        // A zero budget must return nothing; see `Hnsw::search_layer`.
+        if ef == 0 {
             return &mut [];
         }
 
@@ -451,7 +568,9 @@ where
     /// Mirrors [`crate::Hnsw::random_level`], using the runtime `m`.
     fn random_level(&mut self) -> usize {
         let uniform: f64 = self.prng.next_u64() as f64 / u64::MAX as f64;
-        (-libm::log(uniform) * libm::log(self.m as f64).recip()) as usize
+        let scale = self.params.get_level_scale();
+        let level = (-libm::log(uniform) * libm::log(self.m as f64).recip() * scale) as usize;
+        level.min(crate::MAX_LEVEL)
     }
 
     /// Mirrors [`crate::Hnsw::create_node`].

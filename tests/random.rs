@@ -2,9 +2,9 @@
 
 use bitarray::{BitArray, Hamming};
 use hnsw::*;
+use rand::Rng;
 use rand::distributions::{Bernoulli, Standard};
 use rand::seq::SliceRandom;
-use rand::Rng;
 use rand_core::SeedableRng;
 use rand_pcg::Pcg64;
 use space::Neighbor;
@@ -38,7 +38,7 @@ fn linear_1_nn() {
         let nearest = space
             .iter()
             .enumerate()
-            .min_by_key(|(_, &space_feature)| feature.distance(&space_feature))
+            .min_by_key(|&(_, &space_feature)| feature.distance(&space_feature))
             .unwrap();
         // Use HNSW to find the nearest neighbor.
         hnsw.nearest(&feature, 24, searcher, &mut output);
@@ -103,7 +103,7 @@ fn linear_1_nn_inliers() {
         let nearest = space
             .iter()
             .enumerate()
-            .min_by_key(|(_, &space_feature)| feature.distance(&space_feature))
+            .min_by_key(|&(_, &space_feature)| feature.distance(&space_feature))
             .unwrap();
         // Use HNSW to find the nearest neighbor.
         hnsw.nearest(&feature, 24, searcher, &mut output);
