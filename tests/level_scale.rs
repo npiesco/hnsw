@@ -15,14 +15,18 @@
 //!
 //! ## The serialization constraint this respects
 //!
-//! `Params` is a serialized field of `Hnsw`, so adding a field to it changes
-//! every graph blob ever written. Two consequences, both asserted below:
+//! `Params` is a serialized field of `Hnsw`, so adding a field to it would
+//! change every graph blob ever written. The consumer of this crate persists
+//! indexes with **bincode**, which is positional: fields carry no names, so a
+//! new field shifts every subsequent byte and the decoder runs off the end with
+//! "unexpected end of file". `#[serde(default)]` does NOT rescue that — defaults
+//! only apply to self-describing formats such as JSON, where a missing field can
+//! be recognised by name.
 //!
-//! * the field carries `#[serde(default)]`, so indexes written BEFORE it existed
-//!   still deserialize — otherwise a dependency bump would brick every persisted
-//!   index; and
-//! * the default must reproduce the previous behaviour EXACTLY, so the knob is
-//!   provably opt-in rather than a silent change to everyone's graphs.
+//! An earlier revision of this file tested exactly that with a JSON payload,
+//! passed, and was wrong: it proved the property in a format nobody persists
+//! with. The field is therefore `#[serde(skip)]`, and the tests below assert the
+//! byte layout directly against bincode rather than trusting a named format.
 
 use hnsw::{Hnsw, Params, Searcher};
 use rand::{Rng, SeedableRng};
@@ -169,8 +173,8 @@ fn a_flatter_hierarchy_keeps_recall_within_budget() {
 }
 
 /// An index serialized WITHOUT the field must still deserialize. `Params` is a
-/// serialized member of `Hnsw`, so a new field without `#[serde(default)]` would
-/// make every previously written index fail to load.
+/// serialized member of `Hnsw`, so a new field would make every previously
+/// written index fail to load.
 #[cfg(feature = "serde")]
 #[test]
 fn params_without_a_level_scale_field_still_deserialize() {
@@ -187,5 +191,102 @@ fn params_without_a_level_scale_field_still_deserialize() {
         rebuilt.layers(),
         baseline.layers(),
         "a legacy Params deserialized to a level_scale that changes the hierarchy"
+    );
+}
+
+/// THE load-bearing compatibility assertion.
+///
+/// bincode is positional, so the only thing that keeps previously written
+/// indexes loadable is that `Params` still occupies exactly the bytes it used
+/// to. Asserting equality against a stand-in struct holding only the original
+/// field pins that directly, and fails the moment anyone adds a serialized field
+/// here — including by removing the `skip`.
+#[cfg(feature = "serde")]
+#[test]
+fn params_occupy_exactly_the_legacy_bincode_layout() {
+    #[derive(serde::Serialize)]
+    struct LegacyParams {
+        ef_construction: usize,
+    }
+
+    let current = bincode::serialize(&Params::new().level_scale(0.35))
+        .expect("current params must serialize");
+    let legacy = bincode::serialize(&LegacyParams {
+        ef_construction: 400,
+    })
+    .expect("legacy must serialize");
+
+    assert_eq!(
+        current, legacy,
+        "Params no longer serializes to the pre-level_scale byte layout, so every \
+         index written by an earlier build will fail to decode. Note the scale was \
+         set to a NON-default 0.35 here: the bytes must be identical regardless of \
+         its value, because it must not be on the wire at all."
+    );
+}
+
+/// A payload written before the field existed must decode, in the positional
+/// format that actually matters.
+#[cfg(feature = "serde")]
+#[test]
+fn a_legacy_bincode_params_payload_still_decodes() {
+    #[derive(serde::Serialize)]
+    struct LegacyParams {
+        ef_construction: usize,
+    }
+
+    let bytes = bincode::serialize(&LegacyParams {
+        ef_construction: 400,
+    })
+    .unwrap();
+    let decoded: Params =
+        bincode::deserialize(&bytes).expect("a pre-level_scale payload must still decode");
+
+    // It must arrive at the neutral default rather than `f64`'s `0.0`, which
+    // would flatten every future insertion onto layer zero.
+    let rebuilt = build(decoded);
+    let baseline = build(Params::new());
+    assert_eq!(
+        rebuilt.layers(),
+        baseline.layers(),
+        "a legacy payload decoded to a level_scale that changes the hierarchy — \
+         `skip` without an explicit `default` yields 0.0, which collapses it"
+    );
+}
+
+/// An unvalidated scale allocates one layer per level, so a large scale
+/// allocates without bound. Measured before the cap: `level_scale(5000.0)`
+/// produced 3364 layers after ten insertions.
+#[test]
+fn an_extreme_level_scale_cannot_allocate_unbounded_layers() {
+    let mut searcher = Searcher::default();
+    let mut hnsw: Hnsw<Euclidean, Vec<f32>, Pcg64, M, M0> = Hnsw::new_params_and_prng(
+        Euclidean,
+        Params::new().level_scale(5000.0),
+        Pcg64::seed_from_u64(42),
+    );
+    for i in 0..10 {
+        hnsw.insert(vec![i as f32; DIM], &mut searcher);
+    }
+
+    // `layers()` counts the zero layer too, hence the +1.
+    assert!(
+        hnsw.layers() <= 65,
+        "an extreme level scale produced {} layers; the cap is not being applied \
+         and a larger scale would exhaust memory",
+        hnsw.layers()
+    );
+}
+
+/// The cap must not bind on ordinary configurations, or it would silently
+/// truncate a legitimate hierarchy.
+#[test]
+fn the_level_cap_does_not_bind_on_a_normal_index() {
+    let normal = build(Params::new());
+    assert!(
+        normal.layers() < 65,
+        "a default index already reaches {} layers, so the cap is not purely a \
+         safety bound and is reshaping normal graphs",
+        normal.layers()
     );
 }

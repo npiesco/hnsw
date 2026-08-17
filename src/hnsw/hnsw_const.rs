@@ -459,6 +459,14 @@ where
             return &mut [];
         }
 
+        // A zero budget must return nothing. The bound below is tested as
+        // `nearest.len() == cap`, which never holds when `cap` is 0, so without
+        // this the result heap grows without limit and a caller asking for no
+        // results gets a full `dest` worth of them after a complete traversal.
+        if ef == 0 {
+            return &mut [];
+        }
+
         self.initialize_searcher(q, searcher);
         let cap = 1;
 
@@ -766,7 +774,8 @@ where
     fn random_level(&mut self) -> usize {
         let uniform: f64 = self.prng.next_u64() as f64 / u64::MAX as f64;
         let scale = self.params.get_level_scale();
-        (-libm::log(uniform) * libm::log(M as f64).recip() * scale) as usize
+        let level = (-libm::log(uniform) * libm::log(M as f64).recip() * scale) as usize;
+        level.min(crate::MAX_LEVEL)
     }
 
     /// Creates a new node at a layer given its nearest neighbors in that layer.

@@ -430,6 +430,11 @@ where
             return &mut [];
         }
 
+        // A zero budget must return nothing; see `Hnsw::search_layer`.
+        if ef == 0 {
+            return &mut [];
+        }
+
         self.initialize_searcher(q, searcher);
         let cap = 1;
 
@@ -564,7 +569,8 @@ where
     fn random_level(&mut self) -> usize {
         let uniform: f64 = self.prng.next_u64() as f64 / u64::MAX as f64;
         let scale = self.params.get_level_scale();
-        (-libm::log(uniform) * libm::log(self.m as f64).recip() * scale) as usize
+        let level = (-libm::log(uniform) * libm::log(self.m as f64).recip() * scale) as usize;
+        level.min(crate::MAX_LEVEL)
     }
 
     /// Mirrors [`crate::Hnsw::create_node`].
