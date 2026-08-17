@@ -384,52 +384,95 @@ where
         }
     }
 
-    /// Mirrors [`crate::Hnsw::add_neighbor`].
+    /// Mirrors [`crate::Hnsw::add_neighbor`], including its neighbor selection
+    /// heuristic. The two must stay identical: `tests/runtime_parity.rs` holds
+    /// this index byte-identical to the const-generic one for the same degrees,
+    /// seed, and insertion order, and neighbor pruning is part of what it
+    /// compares.
     fn add_neighbor(&mut self, q: &T, node_ix: usize, target_ix: usize, layer: usize) {
-        let (target_feature_ix, target_neighbors): (usize, Vec<usize>) = if layer == 0 {
-            (target_ix, self.zero[target_ix].clone())
-        } else {
-            let target = &self.layers[layer - 1][target_ix];
-            (target.zero_node, target.neighbors.clone())
-        };
-        let target_feature = &self.features[target_feature_ix];
+        let capacity = if layer == 0 { self.m0 } else { self.m };
 
-        let empty_point = target_neighbors.partition_point(|&n| n != EMPTY);
-        if empty_point != target_neighbors.len() {
-            if layer == 0 {
-                self.zero[target_ix][empty_point] = node_ix;
-            } else {
-                self.layers[layer - 1][target_ix].neighbors[empty_point] = node_ix;
-            }
-        } else {
-            let (worst_ix, worst_distance) = target_neighbors
+        let existing: Vec<usize> = if layer == 0 {
+            self.zero[target_ix]
                 .iter()
-                .enumerate()
-                .filter_map(|(ix, &n)| {
-                    if n == EMPTY {
-                        None
-                    } else {
-                        let feat_ix = if layer == 0 {
-                            n
-                        } else {
-                            self.layers[layer - 1][n].zero_node
-                        };
-                        let distance = self
-                            .metric
-                            .distance(target_feature, &self.features[feat_ix]);
-                        Some((ix, distance))
-                    }
-                })
-                .min_by_key(|&(_, distance)| core::cmp::Reverse(distance))
-                .unwrap();
+                .copied()
+                .take_while(|&n| n != EMPTY)
+                .collect()
+        } else {
+            self.layers[layer - 1][target_ix]
+                .neighbors
+                .iter()
+                .copied()
+                .take_while(|&n| n != EMPTY)
+                .collect()
+        };
 
-            if self.metric.distance(q, target_feature) < worst_distance {
-                if layer == 0 {
-                    self.zero[target_ix][worst_ix] = node_ix;
+        if existing.len() < capacity {
+            let slot = existing.len();
+            if layer == 0 {
+                self.zero[target_ix][slot] = node_ix;
+            } else {
+                self.layers[layer - 1][target_ix].neighbors[slot] = node_ix;
+            }
+            return;
+        }
+
+        let kept: Vec<usize> = {
+            let feature_of = |ix: usize| -> &T {
+                if ix == node_ix {
+                    q
+                } else if layer == 0 {
+                    &self.features[ix]
                 } else {
-                    self.layers[layer - 1][target_ix].neighbors[worst_ix] = node_ix;
+                    &self.features[self.layers[layer - 1][ix].zero_node]
+                }
+            };
+
+            let target_feature = feature_of(target_ix);
+
+            let mut candidates: Vec<(usize, Met::Unit)> = Vec::with_capacity(capacity + 1);
+            for &n in &existing {
+                candidates.push((n, self.metric.distance(target_feature, feature_of(n))));
+            }
+            candidates.push((node_ix, self.metric.distance(target_feature, q)));
+            candidates.sort_unstable_by_key(|&(_, distance)| distance);
+
+            let mut kept: Vec<usize> = Vec::with_capacity(capacity);
+            let mut pruned: Vec<usize> = Vec::with_capacity(capacity);
+            for &(ix, distance_to_target) in &candidates {
+                if kept.len() == capacity {
+                    break;
+                }
+                let candidate = feature_of(ix);
+                let diverse = kept.iter().all(|&r| {
+                    distance_to_target < self.metric.distance(candidate, feature_of(r))
+                });
+                if diverse {
+                    kept.push(ix);
+                } else {
+                    pruned.push(ix);
                 }
             }
+
+            for ix in pruned {
+                if kept.len() == capacity {
+                    break;
+                }
+                kept.push(ix);
+            }
+            kept
+        };
+
+        let slots: &mut [usize] = if layer == 0 {
+            &mut self.zero[target_ix][..]
+        } else {
+            &mut self.layers[layer - 1][target_ix].neighbors[..]
+        };
+        for (slot, value) in slots
+            .iter_mut()
+            .zip(kept.into_iter().chain(core::iter::repeat(EMPTY)))
+        {
+            *slot = value;
         }
     }
 }

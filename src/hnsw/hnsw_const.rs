@@ -540,71 +540,117 @@ where
     }
 
     /// Attempts to add a neighbor to a target node.
+    ///
+    /// When the target still has a free slot the neighbor simply goes in it.
+    /// Once the list is full the surviving set is chosen by the neighbor
+    /// selection heuristic (Algorithm 4 of Malkov & Yashunin) rather than by
+    /// keeping the nearest `M`.
+    ///
+    /// Keeping the nearest `M` is correct-looking and pathological on clustered
+    /// data: every member of a dense cluster is nearer to every other member
+    /// than to anything outside it, so each list saturates with its own cluster
+    /// and every outbound link is evicted. The cluster becomes a closed
+    /// component that a search can enter but never leave, and points outside it
+    /// stop being reachable at any `ef`. The heuristic keeps a candidate when it
+    /// is closer to the target than to any neighbor already kept, so one link
+    /// survives per direction instead of `M` links into the nearest blob.
     fn add_neighbor(&mut self, q: &T, node_ix: usize, target_ix: usize, layer: usize) {
-        // Get the feature for the target and get the neighbor slice for the target.
-        // This is different for the zero layer.
-        let (target_feature, target_neighbors) = if layer == 0 {
-            (
-                &self.features[target_ix],
-                &self.zero[target_ix].neighbors[..],
-            )
+        let capacity = if layer == 0 { M0 } else { M };
+
+        // Snapshot the current neighbors so the immutable borrows end before the
+        // write-back. Filled slots are always a prefix, so the count is also the
+        // first free slot.
+        let existing: Vec<usize> = if layer == 0 {
+            self.zero[target_ix].neighbors[..]
+                .iter()
+                .copied()
+                .take_while(|&n| n != !0)
+                .collect()
         } else {
-            let target = &self.layers[layer - 1][target_ix];
-            (
-                &self.features[target.zero_node],
-                &target.neighbors.neighbors[..],
-            )
+            self.layers[layer - 1][target_ix].neighbors.neighbors[..]
+                .iter()
+                .copied()
+                .take_while(|&n| n != !0)
+                .collect()
         };
 
-        // Check if there is a point where the target has empty neighbor slots and add it there in that case.
-        let empty_point = target_neighbors.partition_point(|&n| n != !0);
-        if empty_point != target_neighbors.len() {
-            // In this case we did find the first spot where the target was empty within the slice.
-            // Now we add the neighbor to this slot.
+        if existing.len() < capacity {
+            let slot = existing.len();
             if layer == 0 {
-                self.zero[target_ix as usize].neighbors[empty_point] = node_ix;
+                self.zero[target_ix].neighbors[slot] = node_ix;
             } else {
-                self.layers[layer - 1][target_ix as usize]
-                    .neighbors
-                    .neighbors[empty_point] = node_ix;
+                self.layers[layer - 1][target_ix].neighbors.neighbors[slot] = node_ix;
             }
-        } else {
-            // Otherwise, we need to find the worst neighbor currently.
-            let (worst_ix, worst_distance) = target_neighbors
-                .iter()
-                .enumerate()
-                .filter_map(|(ix, &n)| {
-                    // Compute the distance to be higher than possible if the neighbor is not filled yet so its always filled.
-                    if n == !0 {
-                        None
-                    } else {
-                        // Compute the distance. The feature is looked up differently for the zero layer.
-                        let distance = self.metric.distance(
-                            target_feature,
-                            &self.features[if layer == 0 {
-                                n
-                            } else {
-                                self.layers[layer - 1][n].zero_node
-                            }],
-                        );
-                        Some((ix, distance))
-                    }
-                })
-                // This was done instead of max_by_key because min_by_key takes the first equally bad element.
-                .min_by_key(|&(_, distance)| core::cmp::Reverse(distance))
-                .unwrap();
+            return;
+        }
 
-            // If this is better than the worst, insert it in the worst's place.
-            // This is also different for the zero layer.
-            if self.metric.distance(q, target_feature) < worst_distance {
-                if layer == 0 {
-                    self.zero[target_ix as usize].neighbors[worst_ix] = node_ix;
+        // Borrow every feature involved up front, then work in terms of offsets
+        // into that list. The newcomer's feature is not in `self.features` yet —
+        // that push happens once the whole node is wired up — so it comes from
+        // `q`.
+        let kept: Vec<usize> = {
+            let feature_of = |ix: usize| -> &T {
+                if ix == node_ix {
+                    q
+                } else if layer == 0 {
+                    &self.features[ix]
                 } else {
-                    self.layers[layer - 1][target_ix as usize]
-                        .neighbors
-                        .neighbors[worst_ix] = node_ix;
+                    &self.features[self.layers[layer - 1][ix].zero_node]
+                }
+            };
+
+            let target_feature = feature_of(target_ix);
+
+            let mut candidates: Vec<(usize, Met::Unit)> = Vec::with_capacity(capacity + 1);
+            for &n in &existing {
+                candidates.push((n, self.metric.distance(target_feature, feature_of(n))));
+            }
+            candidates.push((node_ix, self.metric.distance(target_feature, q)));
+            candidates.sort_unstable_by_key(|&(_, distance)| distance);
+
+            let mut kept: Vec<usize> = Vec::with_capacity(capacity);
+            let mut pruned: Vec<usize> = Vec::with_capacity(capacity);
+            for &(ix, distance_to_target) in &candidates {
+                if kept.len() == capacity {
+                    break;
+                }
+                let candidate = feature_of(ix);
+                // Keep it only if it is nearer to the target than to anything
+                // already kept: that is what makes it a link in a new direction
+                // rather than a duplicate of one already held.
+                let diverse = kept.iter().all(|&r| {
+                    distance_to_target < self.metric.distance(candidate, feature_of(r))
+                });
+                if diverse {
+                    kept.push(ix);
+                } else {
+                    pruned.push(ix);
                 }
             }
+
+            // Rather than leave slots empty, refill from the pruned candidates
+            // in ascending distance — the paper's `keepPrunedConnections`.
+            // Degree stays at capacity, so diversity is never bought with
+            // connectivity.
+            for ix in pruned {
+                if kept.len() == capacity {
+                    break;
+                }
+                kept.push(ix);
+            }
+            kept
+        };
+
+        let slots: &mut [usize] = if layer == 0 {
+            &mut self.zero[target_ix].neighbors[..]
+        } else {
+            &mut self.layers[layer - 1][target_ix].neighbors.neighbors[..]
+        };
+        for (slot, value) in slots
+            .iter_mut()
+            .zip(kept.into_iter().chain(core::iter::repeat(!0)))
+        {
+            *slot = value;
         }
     }
 }
