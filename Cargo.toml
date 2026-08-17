@@ -2,7 +2,7 @@
 name = "hnsw"
 version = "0.12.0-alpha.0"
 authors = ["Geordon Worley <vadixidav@gmail.com>"]
-edition = "2018"
+edition = "2024"
 description = "Fast approximate nearest neighbors"
 keywords = ["hamming", "distance", "nearest", "neighbor", "search"]
 categories = ["algorithms", "data-structures", "science"]
@@ -22,7 +22,10 @@ harness = false
 space = { version = "0.17.0", default-features = false, features = ["alloc"] }
 rand_core = "0.6.3"
 hashbrown = "0.11.2"
-serde = { version = "1.0.126", default-features = false, features = ["derive"], optional = true }
+serde = { version = "1.0.126", default-features = false, features = [
+    "derive",
+    "alloc",
+], optional = true }
 libm = "0.2.1"
 ahash = { version = "0.7.4", default-features = false }
 num-traits = { version = "0.2.14", default-features = false }
@@ -58,3 +61,12 @@ debug = true
 
 [package.metadata.docs.rs]
 all-features = true
+
+[lints.rust]
+# Warnings are errors for the code this crate owns. Scoped to this package:
+# Cargo caps lints for non-path dependencies, so this does not impose the
+# setting on downstream consumers.
+warnings = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
