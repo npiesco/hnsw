@@ -316,11 +316,18 @@ where
     }
 
     /// Retrieve the item ID for a given layer item returned by [`HNSW::search_layer`].
+    ///
+    /// `level` follows the same convention as [`HNSW::search_layer`] and
+    /// [`HNSW::layer_len`]: level `n > 0` is `self.layers[n - 1]`, because level
+    /// `0` is the zero layer, which is not stored in `self.layers` at all.
+    /// Indexing `self.layers[level]` here instead panicked for every non-zero
+    /// level — the item index belongs to the layer below the one being indexed,
+    /// and at the top level `self.layers[level]` is out of bounds outright.
     pub fn layer_item_id(&self, level: usize, item: usize) -> usize {
         if level == 0 {
             item
         } else {
-            self.layers[level][item].zero_node
+            self.layers[level - 1][item].zero_node
         }
     }
 
