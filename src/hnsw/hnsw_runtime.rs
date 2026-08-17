@@ -332,13 +332,16 @@ where
         }
 
         let cap = ef;
-        self.search_zero_layer(q, searcher, cap);
 
-        // The zero-layer search excludes soft-deleted nodes from the result
-        // heap, but `lower_search` may have seeded `nearest` with a deleted node
-        // when descending from the upper layers. Drop those so a tombstone can
-        // never surface as a result.
+        // Mirrors [`crate::Hnsw::search_layer`]: `initialize_searcher` seeds
+        // `nearest` with the entry point and `lower_search` re-seeds it at every
+        // descent, neither checking liveness. Scrub tombstones BEFORE the
+        // zero-layer search so they cannot hold one of the `cap` result slots
+        // while it runs. `candidates` is left untouched so traversal through a
+        // deleted node still reaches the live nodes behind it.
         searcher.nearest.retain(|n| !self.is_deleted(n.index));
+
+        self.search_zero_layer(q, searcher, cap);
 
         let found = core::cmp::min(dest.len(), searcher.nearest.len());
         dest[..found].copy_from_slice(&searcher.nearest[..found]);
@@ -419,6 +422,9 @@ where
     /// Mirrors [`crate::Hnsw::initialize_searcher`].
     fn initialize_searcher(&self, q: &T, searcher: &mut Searcher<Met::Unit>) {
         searcher.clear();
+        // Deliberately not deletion-aware — see the note on
+        // [`crate::Hnsw::initialize_searcher`]. A dead seed navigates fine; it
+        // just must not hold a result slot, which `search_layer` handles.
         let entry_distance = self.metric.distance(q, self.entry_feature());
         let candidate = Neighbor {
             index: 0,
