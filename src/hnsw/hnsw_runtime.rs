@@ -1,6 +1,8 @@
+use super::feature_store::FeatureStore;
 use super::nodes::Layer;
 use crate::*;
 use alloc::{vec, vec::Vec};
+use core::marker::PhantomData;
 use rand_core::{RngCore, SeedableRng};
 use space::{Metric, Neighbor};
 
@@ -46,7 +48,7 @@ fn live_neighbors(slice: &[usize]) -> impl Iterator<Item = usize> + '_ {
 /// this produces byte-identical construction + search results to
 /// `Hnsw<_, _, _, M, M0>`; see `tests/runtime_parity.rs`.
 #[derive(Clone)]
-pub struct HnswRuntime<Met, T, R> {
+pub struct HnswRuntime<Met, T, R, S = Vec<T>> {
     metric: Met,
     /// Upper-layer out-degree (the const-generic `M`).
     m: usize,
@@ -55,14 +57,20 @@ pub struct HnswRuntime<Met, T, R> {
     /// Zero-layer neighbor lists. Each entry has length `m0`, `EMPTY`-padded.
     zero: Vec<Vec<usize>>,
     /// Zero-layer features, indexed by zero-node id.
-    features: Vec<T>,
+    features: S,
     /// Non-zero layers.
     layers: Vec<Vec<RuntimeNode>>,
     prng: R,
     params: Params,
+    /// Soft-delete tombstones indexed by zero-node id: `deleted[id] == true`
+    /// means node `id` is logically removed. Mirrors the const-generic index's
+    /// tombstone state. Grown lazily; reads past its end are live.
+    deleted: Vec<bool>,
+    /// `T` appears only behind the storage backend, so it needs anchoring here.
+    _marker: PhantomData<T>,
 }
 
-impl<Met, T, R> HnswRuntime<Met, T, R>
+impl<Met, T, R> HnswRuntime<Met, T, R, Vec<T>>
 where
     R: RngCore + SeedableRng,
 {
@@ -90,7 +98,7 @@ where
     }
 }
 
-impl<Met, T, R> HnswRuntime<Met, T, R>
+impl<Met, T, R> HnswRuntime<Met, T, R, Vec<T>>
 where
     R: RngCore,
 {
@@ -104,6 +112,37 @@ where
     /// # Panics
     /// See [`Self::new`] for the `m`/`m0` guardrails.
     pub fn new_params_and_prng(metric: Met, m: usize, m0: usize, params: Params, prng: R) -> Self {
+        Self::new_with_storage_and_params(metric, m, m0, vec![], params, prng)
+    }
+}
+
+impl<Met, T, R, S> HnswRuntime<Met, T, R, S>
+where
+    R: RngCore,
+    S: FeatureStore<T>,
+{
+    /// Creates a runtime-degree HNSW over a custom feature storage backend.
+    ///
+    /// See [`FeatureStore`] for the contract a backend must uphold.
+    pub fn new_with_storage(metric: Met, m: usize, m0: usize, storage: S, prng: R) -> Self {
+        Self::new_with_storage_and_params(metric, m, m0, storage, Params::default(), prng)
+    }
+
+    /// Creates a runtime-degree HNSW over a custom feature storage backend with
+    /// the passed `params`.
+    ///
+    /// See [`FeatureStore`] for the contract a backend must uphold.
+    ///
+    /// # Panics
+    /// See [`Self::new`] for the `m`/`m0` guardrails.
+    pub fn new_with_storage_and_params(
+        metric: Met,
+        m: usize,
+        m0: usize,
+        storage: S,
+        params: Params,
+        prng: R,
+    ) -> Self {
         assert!(m >= 2, "HnswRuntime requires m >= 2, got {}", m);
         assert!(
             m0 >= m,
@@ -116,10 +155,12 @@ where
             m,
             m0,
             zero: vec![],
-            features: vec![],
+            features: storage,
             layers: vec![],
             prng,
             params,
+            deleted: vec![],
+            _marker: PhantomData,
         }
     }
 
@@ -147,14 +188,53 @@ where
 
     /// Extract the feature for a given item returned by [`Self::nearest`].
     pub fn feature(&self, item: usize) -> &T {
-        &self.features[item]
+        self.features.get_feature(item)
+    }
+
+    /// Number of live (non-deleted) nodes in the index.
+    pub fn live_count(&self) -> usize {
+        self.zero.len() - self.deleted.iter().filter(|&&d| d).count()
+    }
+
+    /// Returns whether zero-node `id` has been soft-deleted.
+    #[inline]
+    pub fn is_deleted(&self, id: usize) -> bool {
+        self.deleted.get(id).copied().unwrap_or(false)
+    }
+
+    /// Soft-deletes zero-node `id`: it is excluded from search results but its
+    /// slot and edges remain in the graph so navigation stays connected until an
+    /// exact rebuild (compaction) reclaims it. Idempotent.
+    pub fn mark_delete(&mut self, id: usize) {
+        if id >= self.deleted.len() {
+            self.deleted.resize(id + 1, false);
+        }
+        self.deleted[id] = true;
+    }
+
+    /// The zero-node id of the current live navigation entry point, or `None`
+    /// if the index has no live nodes. Scans the towers top-down and returns the
+    /// first live node, so a deleted entry point is transparently skipped.
+    pub fn entry(&self) -> Option<usize> {
+        if self.zero.is_empty() {
+            return None;
+        }
+        for layer in self.layers.iter().rev() {
+            for node in layer {
+                if !self.is_deleted(node.zero_node) {
+                    return Some(node.zero_node);
+                }
+            }
+        }
+        (0..self.zero.len()).find(|&id| !self.is_deleted(id))
     }
 }
 
-impl<Met, T, R> HnswRuntime<Met, T, R>
+impl<Met, T, R, S> HnswRuntime<Met, T, R, S>
 where
     R: RngCore,
     Met: Metric<T>,
+    S: FeatureStore<T>,
 {
     /// Inserts a feature into the HNSW. Mirrors [`crate::Hnsw::insert`].
     pub fn insert(&mut self, q: T, searcher: &mut Searcher<Met::Unit>) -> usize {
@@ -167,7 +247,7 @@ where
 
         if self.is_empty() {
             self.zero.push(vec![EMPTY; self.m0]);
-            self.features.push(q);
+            self.features.push_feature(q);
             while self.layers.len() < level {
                 let node = RuntimeNode {
                     zero_node: 0,
@@ -200,7 +280,7 @@ where
 
         self.search_zero_layer(&q, searcher, cap);
         self.create_node(&q, &searcher.nearest, 0);
-        self.features.push(q);
+        self.features.push_feature(q);
 
         let zero_node = self.zero.len() - 1;
         while self.layers.len() < level {
@@ -234,7 +314,7 @@ where
         searcher: &mut Searcher<Met::Unit>,
         dest: &'a mut [Neighbor<Met::Unit>],
     ) -> &'a mut [Neighbor<Met::Unit>] {
-        if self.features.is_empty() || level >= self.layers() {
+        if self.features.feature_count() == 0 || level >= self.layers() {
             return &mut [];
         }
 
@@ -253,6 +333,12 @@ where
 
         let cap = ef;
         self.search_zero_layer(q, searcher, cap);
+
+        // The zero-layer search excludes soft-deleted nodes from the result
+        // heap, but `lower_search` may have seeded `nearest` with a deleted node
+        // when descending from the upper layers. Drop those so a tombstone can
+        // never surface as a result.
+        searcher.nearest.retain(|n| !self.is_deleted(n.index));
 
         let found = core::cmp::min(dest.len(), searcher.nearest.len());
         dest[..found].copy_from_slice(&searcher.nearest[..found]);
@@ -278,7 +364,21 @@ where
                     Layer::Zero => neighbor,
                 };
                 if searcher.seen.insert(node_to_visit) {
-                    let distance = self.metric.distance(q, &self.features[node_to_visit]);
+                    let distance = self
+                        .metric
+                        .distance(q, self.features.get_feature(node_to_visit));
+                    // At the zero (result) layer a soft-deleted node is still
+                    // traversed — so live nodes reachable only through it stay
+                    // reachable — but it must NEVER enter the result heap nor
+                    // consume the `cap` budget, otherwise the result set
+                    // under-fills with live neighbors crowded out by tombstones.
+                    if matches!(layer, Layer::Zero) && self.is_deleted(node_to_visit) {
+                        searcher.candidates.push(Neighbor {
+                            index: neighbor,
+                            distance,
+                        });
+                        continue;
+                    }
                     let pos = searcher.nearest.partition_point(|n| n.distance <= distance);
                     if pos != cap {
                         if searcher.nearest.len() == cap {
@@ -336,9 +436,9 @@ where
 
     fn entry_feature(&self) -> &T {
         if let Some(last_layer) = self.layers.last() {
-            &self.features[last_layer[0].zero_node]
+            self.features.get_feature(last_layer[0].zero_node)
         } else {
-            &self.features[0]
+            self.features.get_feature(0)
         }
     }
 
@@ -422,9 +522,10 @@ where
                 if ix == node_ix {
                     q
                 } else if layer == 0 {
-                    &self.features[ix]
+                    self.features.get_feature(ix)
                 } else {
-                    &self.features[self.layers[layer - 1][ix].zero_node]
+                    self.features
+                        .get_feature(self.layers[layer - 1][ix].zero_node)
                 }
             };
 
@@ -444,9 +545,9 @@ where
                     break;
                 }
                 let candidate = feature_of(ix);
-                let diverse = kept.iter().all(|&r| {
-                    distance_to_target < self.metric.distance(candidate, feature_of(r))
-                });
+                let diverse = kept
+                    .iter()
+                    .all(|&r| distance_to_target < self.metric.distance(candidate, feature_of(r)));
                 if diverse {
                     kept.push(ix);
                 } else {

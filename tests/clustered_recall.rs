@@ -91,7 +91,8 @@ fn a_dense_cluster_does_not_hide_points_outside_it() {
         assert!(
             *d < 10.0,
             "expected the three points beside the origin (distances 1, 2, 3), \
-             got {got:?} — the far cluster pruned every link reaching them"
+             got {:?} — the far cluster pruned every link reaching them",
+            got
         );
     }
 }
@@ -103,7 +104,9 @@ fn cross_cluster_reachability_does_not_depend_on_insertion_order() {
         for d in &got {
             assert!(
                 *d < 10.0,
-                "near_first={near_first}: got {got:?}, expected the near points"
+                "near_first={}: got {:?}, expected the near points",
+                near_first,
+                got
             );
         }
     }
@@ -116,7 +119,12 @@ fn cross_cluster_reachability_does_not_depend_on_a_large_candidate_pool() {
     for ef in [4, 16, 64, 200, 1000] {
         let got = near_then_far(ef, true);
         for d in &got {
-            assert!(*d < 10.0, "ef={ef}: got {got:?}, expected the near points");
+            assert!(
+                *d < 10.0,
+                "ef={}: got {:?}, expected the near points",
+                ef,
+                got
+            );
         }
     }
 }
@@ -187,6 +195,6 @@ fn the_runtime_index_has_the_same_cross_cluster_reachability() {
 
     assert_eq!(got.len(), 3);
     for d in &got {
-        assert!(*d < 10.0, "runtime index: got {got:?}");
+        assert!(*d < 10.0, "runtime index: got {:?}", got);
     }
 }
