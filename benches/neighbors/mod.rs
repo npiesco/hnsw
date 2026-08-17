@@ -14,7 +14,7 @@ fn bench_neighbors(c: &mut Criterion) {
     let all_sizes = (space_mags).map(|n| 2usize.pow(n));
     let max_linear_size = 2usize.pow(14);
     let filepath = "data/akaze";
-    let total_descriptors = all_sizes.clone().rev().next().unwrap();
+    let total_descriptors = all_sizes.clone().next_back().unwrap();
     let descriptor_size_bytes = 61;
     let total_query_strings = 10000;
 

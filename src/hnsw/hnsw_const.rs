@@ -1,7 +1,9 @@
+use super::feature_store::FeatureStore;
 use super::nodes::{HasNeighbors, Layer};
 use crate::hnsw::nodes::{NeighborNodes, Node};
 use crate::*;
 use alloc::{vec, vec::Vec};
+use core::marker::PhantomData;
 use num_traits::Zero;
 use rand_core::{RngCore, SeedableRng};
 #[cfg(feature = "serde")]
@@ -11,16 +13,20 @@ use space::{Knn, KnnPoints, Metric, Neighbor};
 /// This provides a HNSW implementation for any distance function.
 ///
 /// The type `T` must implement [`space::Metric`] to get implementations.
+///
+/// The type `S` is the feature storage backend and defaults to [`Vec<T>`].
+/// Supplying another [`FeatureStore`] keeps the features outside the heap — in
+/// an `mmap`ed file, say — while the graph stays in memory.
 #[derive(Clone)]
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),
     serde(bound(
-        serialize = "Met: Serialize, T: Serialize, R: Serialize",
-        deserialize = "Met: Deserialize<'de>, T: Deserialize<'de>, R: Deserialize<'de>"
+        serialize = "Met: Serialize, T: Serialize, R: Serialize, S: Serialize",
+        deserialize = "Met: Deserialize<'de>, T: Deserialize<'de>, R: Deserialize<'de>, S: Deserialize<'de>"
     ))
 )]
-pub struct Hnsw<Met, T, R, const M: usize, const M0: usize> {
+pub struct Hnsw<Met, T, R, const M: usize, const M0: usize, S = Vec<T>> {
     /// Contains the space metric.
     metric: Met,
     /// Contains the zero layer.
@@ -28,7 +34,7 @@ pub struct Hnsw<Met, T, R, const M: usize, const M0: usize> {
     /// Contains the features of the zero layer.
     /// These are stored separately to allow SIMD speedup in the future by
     /// grouping small worlds of features together.
-    features: Vec<T>,
+    features: S,
     /// Contains each non-zero layer.
     layers: Vec<Vec<Node<M>>>,
     /// This needs to create resonably random outputs to determine the levels of insertions.
@@ -42,9 +48,13 @@ pub struct Hnsw<Met, T, R, const M: usize, const M0: usize> {
     /// [`Hnsw::mark_delete`]. Grown lazily; reads past its end are live.
     #[cfg_attr(feature = "serde", serde(skip))]
     deleted: Vec<bool>,
+    /// `T` appears only behind the storage backend, so it needs anchoring here.
+    /// Skipped by serde so the snapshot format is unchanged.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    _marker: PhantomData<T>,
 }
 
-impl<Met, T, R, const M: usize, const M0: usize> Hnsw<Met, T, R, M, M0>
+impl<Met, T, R, const M: usize, const M0: usize> Hnsw<Met, T, R, M, M0, Vec<T>>
 where
     R: RngCore + SeedableRng,
 {
@@ -58,6 +68,7 @@ where
             prng: R::from_seed(R::Seed::default()),
             params: Params::new(),
             deleted: vec![],
+            _marker: PhantomData,
         }
     }
 
@@ -71,6 +82,7 @@ where
             prng: R::from_seed(R::Seed::default()),
             params,
             deleted: vec![],
+            _marker: PhantomData,
         }
     }
 
@@ -83,14 +95,16 @@ where
             prng: R::from_seed(R::Seed::default()),
             params,
             deleted: vec![],
+            _marker: PhantomData,
         }
     }
 }
 
-impl<Met, T, R, const M: usize, const M0: usize> Knn for Hnsw<Met, T, R, M, M0>
+impl<Met, T, R, const M: usize, const M0: usize, S> Knn for Hnsw<Met, T, R, M, M0, S>
 where
     R: RngCore,
     Met: Metric<T>,
+    S: FeatureStore<T>,
 {
     type Ix = usize;
     type Metric = Met;
@@ -114,17 +128,18 @@ where
     }
 }
 
-impl<Met, T, R, const M: usize, const M0: usize> KnnPoints for Hnsw<Met, T, R, M, M0>
+impl<Met, T, R, const M: usize, const M0: usize, S> KnnPoints for Hnsw<Met, T, R, M, M0, S>
 where
     R: RngCore,
     Met: Metric<T>,
+    S: FeatureStore<T>,
 {
     fn get_point(&self, index: usize) -> &'_ T {
-        &self.features[index]
+        self.features.get_feature(index)
     }
 }
 
-impl<Met, T, R, const M: usize, const M0: usize> Hnsw<Met, T, R, M, M0>
+impl<Met, T, R, const M: usize, const M0: usize> Hnsw<Met, T, R, M, M0, Vec<T>>
 where
     R: RngCore,
     Met: Metric<T>,
@@ -139,6 +154,7 @@ where
             prng,
             params: Default::default(),
             deleted: vec![],
+            _marker: PhantomData,
         }
     }
 
@@ -152,6 +168,47 @@ where
             prng,
             params,
             deleted: vec![],
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Met, T, R, const M: usize, const M0: usize, S> Hnsw<Met, T, R, M, M0, S>
+where
+    R: RngCore,
+    Met: Metric<T>,
+    S: FeatureStore<T>,
+{
+    /// Creates a HNSW over a custom feature storage backend.
+    ///
+    /// See [`FeatureStore`] for the contract a backend must uphold.
+    pub fn new_with_storage(metric: Met, storage: S, prng: R) -> Self {
+        Self {
+            metric,
+            zero: vec![],
+            features: storage,
+            layers: vec![],
+            prng,
+            params: Default::default(),
+            deleted: vec![],
+            _marker: PhantomData,
+        }
+    }
+
+    /// Creates a HNSW over a custom feature storage backend with the passed
+    /// `params`.
+    ///
+    /// See [`FeatureStore`] for the contract a backend must uphold.
+    pub fn new_with_storage_and_params(metric: Met, storage: S, params: Params, prng: R) -> Self {
+        Self {
+            metric,
+            zero: vec![],
+            features: storage,
+            layers: vec![],
+            prng,
+            params,
+            deleted: vec![],
+            _marker: PhantomData,
         }
     }
 
@@ -171,7 +228,7 @@ where
             self.zero.push(NeighborNodes {
                 neighbors: [!0; M0],
             });
-            self.features.push(q);
+            self.features.push_feature(q);
 
             // Add all the layers its in.
             while self.layers.len() < level {
@@ -216,7 +273,7 @@ where
         self.search_zero_layer(&q, searcher, cap);
         self.create_node(&q, &searcher.nearest, 0);
         // Add the feature to the zero layer.
-        self.features.push(q);
+        self.features.push_feature(q);
 
         // Add all level vectors needed to be able to add this level.
         let zero_node = self.zero.len() - 1;
@@ -250,12 +307,12 @@ where
     ///
     /// The `item` must be retrieved from [`HNSW::search_layer`].
     pub fn feature(&self, item: usize) -> &T {
-        &self.features[item as usize]
+        self.features.get_feature(item)
     }
 
     /// Extract the feature from a particular level for a given item returned by [`HNSW::search_layer`].
     pub fn layer_feature(&self, level: usize, item: usize) -> &T {
-        &self.features[self.layer_item_id(level, item) as usize]
+        self.features.get_feature(self.layer_item_id(level, item))
     }
 
     /// Retrieve the item ID for a given layer item returned by [`HNSW::search_layer`].
@@ -263,7 +320,7 @@ where
         if level == 0 {
             item
         } else {
-            self.layers[level][item as usize].zero_node
+            self.layers[level][item].zero_node
         }
     }
 
@@ -277,7 +334,7 @@ where
 
     pub fn layer_len(&self, level: usize) -> usize {
         if level == 0 {
-            self.features.len()
+            self.features.feature_count()
         } else if level < self.layers() {
             self.layers[level - 1].len()
         } else {
@@ -345,7 +402,7 @@ where
         dest: &'a mut [Neighbor<Met::Unit>],
     ) -> &'a mut [Neighbor<Met::Unit>] {
         // If there is nothing in here, then just return nothing.
-        if self.features.is_empty() || level >= self.layers() {
+        if self.features.feature_count() == 0 || level >= self.layers() {
             return &mut [];
         }
 
@@ -389,11 +446,11 @@ where
     ) {
         while let Some(Neighbor { index, .. }) = searcher.candidates.pop() {
             for neighbor in match layer {
-                Layer::NonZero(layer) => layer[index as usize].get_neighbors(),
-                Layer::Zero => self.zero[index as usize].get_neighbors(),
+                Layer::NonZero(layer) => layer[index].get_neighbors(),
+                Layer::Zero => self.zero[index].get_neighbors(),
             } {
                 let node_to_visit = match layer {
-                    Layer::NonZero(layer) => layer[neighbor as usize].zero_node,
+                    Layer::NonZero(layer) => layer[neighbor].zero_node,
                     Layer::Zero => neighbor,
                 };
 
@@ -404,7 +461,7 @@ where
                     // Compute the distance of this neighbor.
                     let distance = self
                         .metric
-                        .distance(q, &self.features[node_to_visit as usize]);
+                        .distance(q, self.features.get_feature(node_to_visit));
                     // At the zero (result) layer a soft-deleted node is still
                     // traversed — so live nodes reachable only through it stay
                     // reachable — but it must NEVER enter the result heap nor
@@ -412,7 +469,7 @@ where
                     // under-fills with live neighbors crowded out by tombstones.
                     if matches!(layer, Layer::Zero) && self.is_deleted(node_to_visit) {
                         searcher.candidates.push(Neighbor {
-                            index: neighbor as usize,
+                            index: neighbor,
                             distance,
                         });
                         continue;
@@ -427,7 +484,7 @@ where
                         }
                         // Either way, add the new item.
                         let candidate = Neighbor {
-                            index: neighbor as usize,
+                            index: neighbor,
                             distance,
                         };
                         searcher.nearest.insert(pos, candidate);
@@ -455,7 +512,7 @@ where
         searcher.nearest.clear();
         searcher.seen.clear();
         // Update the node to the next layer.
-        let new_index = layer[index].next_node as usize;
+        let new_index = layer[index].next_node;
         let candidate = Neighbor {
             index: new_index,
             distance,
@@ -491,15 +548,15 @@ where
     /// Gets the entry point's feature.
     fn entry_feature(&self) -> &T {
         if let Some(last_layer) = self.layers.last() {
-            &self.features[last_layer[0].zero_node as usize]
+            self.features.get_feature(last_layer[0].zero_node)
         } else {
-            &self.features[0]
+            self.features.get_feature(0)
         }
     }
 
     /// Generates a correctly distributed random level as per Algorithm 1 line 4 of the paper.
     fn random_level(&mut self) -> usize {
-        let uniform: f64 = self.prng.next_u64() as f64 / core::u64::MAX as f64;
+        let uniform: f64 = self.prng.next_u64() as f64 / u64::MAX as f64;
         (-libm::log(uniform) * libm::log(M as f64).recip()) as usize
     }
 
@@ -510,11 +567,11 @@ where
             let new_index = self.zero.len();
             let mut neighbors: [usize; M0] = [!0; M0];
             for (d, s) in neighbors.iter_mut().zip(nearest.iter()) {
-                *d = s.index as usize;
+                *d = s.index;
             }
             let node = NeighborNodes { neighbors };
             for neighbor in node.get_neighbors() {
-                self.add_neighbor(q, new_index as usize, neighbor, layer);
+                self.add_neighbor(q, new_index, neighbor, layer);
             }
             self.zero.push(node);
         } else {
@@ -593,9 +650,10 @@ where
                 if ix == node_ix {
                     q
                 } else if layer == 0 {
-                    &self.features[ix]
+                    self.features.get_feature(ix)
                 } else {
-                    &self.features[self.layers[layer - 1][ix].zero_node]
+                    self.features
+                        .get_feature(self.layers[layer - 1][ix].zero_node)
                 }
             };
 
@@ -618,9 +676,9 @@ where
                 // Keep it only if it is nearer to the target than to anything
                 // already kept: that is what makes it a link in a new direction
                 // rather than a duplicate of one already held.
-                let diverse = kept.iter().all(|&r| {
-                    distance_to_target < self.metric.distance(candidate, feature_of(r))
-                });
+                let diverse = kept
+                    .iter()
+                    .all(|&r| distance_to_target < self.metric.distance(candidate, feature_of(r)));
                 if diverse {
                     kept.push(ix);
                 } else {

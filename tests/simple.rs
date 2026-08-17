@@ -39,7 +39,7 @@ impl TestBruteForceHelper {
         let mut candidates: Vec<(usize, u64)> = self
             .vectors
             .iter()
-            .map(|v| (v.0.clone(), metric.distance(&query, &v.1.as_slice())))
+            .map(|v| (v.0, metric.distance(&query, &v.1.as_slice())))
             .collect_vec();
 
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -147,10 +147,9 @@ where
     );
     let correct_worst_distances: Vec<_> = query_strings
         .iter()
-        .cloned()
         .map(|feature| {
             let mut v = vec![];
-            for distance in search_space.iter().map(|n| Hamming.distance(n, &feature)) {
+            for distance in search_space.iter().map(|n| Hamming.distance(n, feature)) {
                 let pos = v.binary_search(&distance).unwrap_or_else(|e| e);
                 v.insert(pos, distance);
                 if v.len() > opt.k {
