@@ -624,10 +624,16 @@ where
                         },
                     );
                 } else if !within_beam {
-                    // Excluded AND outside the beam. Keeping it out of the
-                    // frontier is what bounds the frontier's SIZE; it does not
-                    // change the distance-evaluation count, so no work-count test
-                    // can observe it.
+                    // Excluded AND outside the beam: not expanded.
+                    //
+                    // An earlier comment here claimed this could not affect the
+                    // distance-evaluation count and that no work-count test could
+                    // observe it. That was WRONG. Suppressing a frontier push
+                    // removes that node's entire descendant expansion, and every
+                    // descendant costs a distance evaluation. The unfiltered path
+                    // proved it: the same push made unconditionally for tombstones
+                    // pinned work at ~101% of N regardless of deletion density,
+                    // versus 55% once the identical gate was applied.
                     continue;
                 }
 
@@ -666,16 +672,37 @@ where
                     let distance = self
                         .metric
                         .distance(q, self.features.get_feature(node_to_visit));
-                    // At the zero (result) layer a soft-deleted node is still
-                    // traversed — so live nodes reachable only through it stay
-                    // reachable — but it must NEVER enter the result heap nor
-                    // consume the `cap` budget, otherwise the result set
-                    // under-fills with live neighbors crowded out by tombstones.
+                    // At the zero (result) layer a soft-deleted node must NEVER
+                    // enter the result heap nor consume the `cap` budget, or the
+                    // result set under-fills with live neighbors crowded out by
+                    // tombstones. It remains eligible for TRAVERSAL, so live
+                    // nodes behind it can still be found — but only while it
+                    // falls within the beam, exactly as a live node must.
+                    //
+                    // This is approximate-search pruning, not a connectivity
+                    // guarantee: a tombstone outside the beam is not expanded,
+                    // so a live node reachable only through it is not found.
+                    // That is the same outcome an equally distant LIVE
+                    // intermediate would produce, which is the point — tombstones
+                    // are equal citizens rather than privileged ones.
+                    //
+                    // Pushing unconditionally let tombstones escape the
+                    // `pos != cap` check below, so the search expanded the entire
+                    // tombstoned subgraph however distant it was: work was pinned
+                    // at ~101% of N at every deletion density (3973/4040/4048/4048
+                    // evals per query at 25/50/75/90%) — a full scan — versus
+                    // 1693/1361/875/413 for an index rebuilt with only live nodes.
+                    // Recall was 1.0 throughout precisely BECAUSE it was scanning
+                    // everything, so the defect hid behind perfect recall while
+                    // ignoring the caller's `ef` budget.
+
                     if matches!(layer, Layer::Zero) && self.is_deleted(node_to_visit) {
-                        searcher.candidates.push(Neighbor {
-                            index: neighbor,
-                            distance,
-                        });
+                        if searcher.nearest.partition_point(|n| n.distance <= distance) != cap {
+                            searcher.candidates.push(Neighbor {
+                                index: neighbor,
+                                distance,
+                            });
+                        }
                         continue;
                     }
                     // Attempt to insert into nearest queue.
@@ -938,5 +965,122 @@ where
 {
     fn default() -> Self {
         Self::new(Met::default())
+    }
+}
+
+#[cfg(test)]
+mod beam_gate_tests {
+    //! Hand-constructed graphs pinning the two invariants a tombstone must
+    //! satisfy on the traversal frontier.
+    //!
+    //! Statistical recall tests cannot separate these: both invariants can be
+    //! violated in opposite directions while average recall stays high. These
+    //! build the exact topology instead, so each test fails for one specific
+    //! reason.
+    //!
+    //! The graph (query at 0.0, distance is absolute difference):
+    //!
+    //! ```text
+    //! node 0  seed       d=10  --> {1, 2}
+    //! node 1  live       d=1   --> {}
+    //! node 2  TOMBSTONE  d=5   --> {3}
+    //! node 3  live       d=0   --> {}          reachable ONLY through node 2
+    //! ```
+    //!
+    //! Node 3 is the best answer in the graph and sits behind a tombstone, which
+    //! is what makes the pair discriminating.
+
+    use super::*;
+    use crate::Params;
+    use rand_pcg::Pcg64;
+    use space::{Metric, Neighbor};
+
+    struct Abs;
+
+    impl Metric<f32> for Abs {
+        type Unit = u64;
+        fn distance(&self, a: &f32, b: &f32) -> u64 {
+            (a - b).abs() as u64
+        }
+    }
+
+    /// `M0 = 4` so the hand-written neighbour lists fit; `!0` terminates them.
+    fn graph() -> Hnsw<Abs, f32, Pcg64, 2, 4> {
+        let edges: [[usize; 4]; 4] = [
+            [1, 2, !0, !0],  // seed reaches the near live node and the tombstone
+            [!0; 4],         // near live node is a dead end
+            [3, !0, !0, !0], // tombstone is the ONLY route to node 3
+            [!0; 4],         // best node is a dead end
+        ];
+
+        Hnsw {
+            metric: Abs,
+            zero: edges.map(|neighbors| NeighborNodes { neighbors }).to_vec(),
+            features: vec![10.0f32, 1.0, 5.0, 0.0],
+            layers: Vec::new(),
+            prng: Pcg64::new(0, 0),
+            params: Params::new(),
+            // Node 2 is soft-deleted.
+            deleted: vec![false, false, true, false],
+            _marker: PhantomData,
+        }
+    }
+
+    fn search(ef: usize, k: usize) -> Vec<usize> {
+        let hnsw = graph();
+        let mut searcher = Searcher::default();
+        let mut dest = vec![
+            Neighbor {
+                index: !0,
+                distance: !0
+            };
+            k
+        ];
+        hnsw.nearest(&0.0f32, ef, &mut searcher, &mut dest)
+            .iter()
+            .map(|n| n.index)
+            .collect()
+    }
+
+    /// INVARIANT 1: a tombstone outside the beam must not be expanded.
+    ///
+    /// With `ef == 1` the near live node (d=1) immediately tightens the beam, so
+    /// the tombstone at d=5 falls outside it. Node 3 must therefore never be
+    /// evaluated — exactly as it would not be if node 2 were a LIVE node at d=5.
+    ///
+    /// This fails against the old unconditional `candidates.push`, which expanded
+    /// the tombstone regardless of distance and surfaced node 3.
+    #[test]
+    fn a_tombstone_outside_the_beam_is_not_expanded() {
+        let got = search(1, 1);
+        assert_eq!(
+            got,
+            vec![1],
+            "expected only the near live node; finding node 3 means the tombstone \
+             at d=5 was expanded despite falling outside an ef=1 beam already \
+             holding a d=1 result"
+        );
+    }
+
+    /// INVARIANT 2: a tombstone INSIDE the beam must still be expanded.
+    ///
+    /// With `ef == 2` the beam holds both d=1 and d=10, so the tombstone at d=5
+    /// is within it and must be traversed — otherwise node 3, the best answer in
+    /// the graph, becomes permanently unreachable.
+    ///
+    /// This fails against an overcorrection that simply stops traversing
+    /// tombstones, which a work-count test alone would happily accept.
+    #[test]
+    fn a_tombstone_inside_the_beam_is_still_expanded() {
+        let got = search(2, 2);
+        assert!(
+            got.contains(&3),
+            "node 3 is reachable only through the tombstone at d=5, which is \
+             inside an ef=2 beam and must still be traversed; got {got:?}"
+        );
+        assert!(
+            !got.contains(&2),
+            "the tombstone itself must never be returned as a result; got {got:?}"
+        );
     }
 }
