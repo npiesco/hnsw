@@ -93,22 +93,37 @@ index was serialized by an earlier version.
 
 ### Behavioral impact
 
-- **Graph construction changed** in [#1](https://github.com/npiesco/hnsw/pull/1)
-  (neighbor selection). An index serialized before that change does not match one
-  built after it from the same input. Note that `tests/runtime_parity.rs` cannot
-  detect this: it compares the two implementations against each other with no
-  golden reference, so a change applied to both leaves it green.
+Stated conditionally, because these do not all apply to every workload:
 
-- **Search results changed** in [#1](https://github.com/npiesco/hnsw/pull/1),
-  [#3](https://github.com/npiesco/hnsw/pull/3),
-  [#7](https://github.com/npiesco/hnsw/pull/7) and
-  [#9](https://github.com/npiesco/hnsw/pull/9). Consumers that pin golden query
-  outputs will need to re-derive them.
+- **Graph construction can change** with
+  [#1](https://github.com/npiesco/hnsw/pull/1). The new neighbour selection only
+  differs once a neighbour list SATURATES, so a corpus that never fills one
+  builds an identical graph. Where pruning is exercised, an index built after the
+  change differs from one built before it from the same input. Previously
+  serialized indexes remain loadable — the format did not change — but they no
+  longer match a fresh rebuild.
 
-- **`ef` buys less work than it used to** after
-  [#9](https://github.com/npiesco/hnsw/pull/9), because the traversal no longer
-  over-expands. A consumer that tuned `ef` against the old depth-first traversal
-  should re-derive it against recall rather than carrying the old number over.
+- **Search results change for newly built indexes** with
+  [#1](https://github.com/npiesco/hnsw/pull/1), because the graph differs. An
+  index serialized BEFORE that change and queried by new code is unaffected by
+  it: the links are already baked in.
+
+- **Search results change for every query** with
+  [#9](https://github.com/npiesco/hnsw/pull/9), which alters the query traversal
+  itself and so applies to old and new graphs alike. Anything pinning golden
+  query outputs must re-derive them.
+
+- **Tombstone workloads only** for [#3](https://github.com/npiesco/hnsw/pull/3)
+  and [#7](https://github.com/npiesco/hnsw/pull/7). An index that has never had
+  `mark_delete` called on it sees no change from either.
+
+- **The same `ef` now performs less expansion** after
+  [#9](https://github.com/npiesco/hnsw/pull/9), and may therefore give lower
+  recall at equal `ef`. `ef` bounds the result list, not the work, and the
+  previous depth-first traversal over-expanded — which is why it scored better at
+  equal `ef` and worse per distance evaluation. A consumer that tuned `ef`
+  against the old traversal should re-derive it against measured recall rather
+  than carrying the old number over.
 
 ### Testing notes
 
@@ -119,5 +134,16 @@ index was serialized by an earlier version.
   the runtime-degree index, which had none.
 - [#10](https://github.com/npiesco/hnsw/pull/10) corrected traversal claims that
   went stale with [#9](https://github.com/npiesco/hnsw/pull/9), fixed ten broken
-  rustdoc links, and narrowed `runtime_parity.rs`'s documented scope to what it
-  actually checks.
+  rustdoc links, narrowed `runtime_parity.rs`'s documented scope to what it
+  actually checks, and strengthened the accept-all filtered test from
+  `recall > 0.5` to exact equality with unfiltered search — a contract that only
+  became available once both paths shared one traversal.
+
+### Known gaps
+
+- **Nothing pins the graph itself.** `tests/runtime_parity.rs` compares the
+  const-generic and runtime implementations against each other, so a change
+  applied to both — which any change to shared insert behaviour must be — leaves
+  it green. There is no golden serialized fixture and no graph fingerprint, so
+  "graph construction changed" above is reasoned from the code rather than
+  caught by a test.
