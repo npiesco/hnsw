@@ -492,8 +492,24 @@ where
         // reachable only through a deleted node stay reachable.
         searcher.nearest.retain(|n| !self.is_deleted(n.index));
 
-        // search the zero layer
-        self.search_zero_layer(q, searcher, cap);
+        // Search the zero layer BEST-FIRST, with an accept-all predicate.
+        //
+        // This previously called `search_zero_layer`, which drains
+        // `Searcher.candidates` — a LIFO `Vec` — so the traversal was
+        // depth-first with no termination check. That is a deviation from the
+        // paper's Algorithm 2, which uses a priority queue and stops once the
+        // nearest remaining candidate is worse than the current worst result,
+        // and it is strictly worse: measured against distance evaluations rather
+        // than at equal `ef`, best-first reached higher recall for less work at
+        // every comparable point on the curve. At N=20000 it reached 0.7700
+        // recall in 2573 evaluations where depth-first needed 4323 to reach
+        // 0.7800 and managed only 0.6940 by 3154.
+        //
+        // Note the comparison at equal `ef` looks the other way round, because
+        // `ef` bounds the RESULT LIST rather than the expansion, and the
+        // depth-first traversal simply does much more work for the same `ef`.
+        // The recall-per-evaluation curve is the honest comparison.
+        self.search_zero_layer_best_first(q, searcher, cap, &|_| true);
 
         let found = core::cmp::min(dest.len(), searcher.nearest.len());
         dest[..found].copy_from_slice(&searcher.nearest[..found]);
