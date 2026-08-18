@@ -28,7 +28,7 @@
 //! with. The field is therefore `#[serde(skip)]`, and the tests below assert the
 //! byte layout directly against bincode rather than trusting a named format.
 
-use hnsw::{Hnsw, Params, Searcher};
+use hnsw::{Hnsw, HnswRuntime, Params, Searcher};
 use rand::{Rng, SeedableRng};
 use rand_pcg::Pcg64;
 use space::{Metric, Neighbor};
@@ -62,6 +62,19 @@ fn corpus() -> Vec<Vec<f32>> {
 fn build(params: Params) -> Hnsw<Euclidean, Vec<f32>, Pcg64, M, M0> {
     let mut searcher = Searcher::default();
     let mut hnsw = Hnsw::new_params_and_prng(Euclidean, params, Pcg64::seed_from_u64(42));
+    for f in corpus() {
+        hnsw.insert(f.clone(), &mut searcher);
+    }
+    hnsw
+}
+
+/// The runtime-degree index has its OWN copy of `random_level`, so every
+/// property asserted for the const-generic index has to be asserted here too or
+/// half the change is unverified.
+fn build_runtime(params: Params) -> HnswRuntime<Euclidean, Vec<f32>, Pcg64> {
+    let mut searcher = Searcher::default();
+    let mut hnsw =
+        HnswRuntime::new_params_and_prng(Euclidean, M, M0, params, Pcg64::seed_from_u64(42));
     for f in corpus() {
         hnsw.insert(f.clone(), &mut searcher);
     }
@@ -287,6 +300,86 @@ fn the_level_cap_does_not_bind_on_a_normal_index() {
         normal.layers() < 65,
         "a default index already reaches {} layers, so the cap is not purely a \
          safety bound and is reshaping normal graphs",
+        normal.layers()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-degree index.
+//
+// `HnswRuntime` carries its own `random_level`, so the const-generic tests above
+// prove nothing about it. Both the scale multiplication and the level cap were
+// applied to both files; without these, half of that change ships unverified.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_default_level_scale_reproduces_the_previous_hierarchy() {
+    let plain = build_runtime(Params::new());
+    let explicit = build_runtime(Params::new().level_scale(1.0));
+
+    assert_eq!(
+        plain.layers(),
+        explicit.layers(),
+        "runtime: an explicit scale of 1.0 produced a different number of layers \
+         than the default"
+    );
+    // HnswRuntime exposes no per-layer length accessor, so total node count is
+    // the finest structural comparison available here.
+    assert_eq!(
+        plain.len(),
+        explicit.len(),
+        "runtime: node count differs between the default and an explicit 1.0"
+    );
+}
+
+#[test]
+fn runtime_smaller_level_scale_produces_a_shallower_hierarchy() {
+    let tall = build_runtime(Params::new());
+    let flat = build_runtime(Params::new().level_scale(0.35));
+
+    assert!(
+        flat.layers() < tall.layers(),
+        "runtime: level_scale 0.35 produced {} layers, not fewer than the \
+         default's {} - the parameter is not reaching the runtime random_level",
+        flat.layers(),
+        tall.layers()
+    );
+    assert_eq!(
+        flat.len(),
+        N,
+        "runtime: flattening the hierarchy lost nodes from the zero layer"
+    );
+}
+
+#[test]
+fn runtime_extreme_level_scale_cannot_allocate_unbounded_layers() {
+    let mut searcher = Searcher::default();
+    let mut hnsw = HnswRuntime::new_params_and_prng(
+        Euclidean,
+        M,
+        M0,
+        Params::new().level_scale(5000.0),
+        Pcg64::seed_from_u64(42),
+    );
+    for i in 0..10 {
+        hnsw.insert(vec![i as f32; DIM], &mut searcher);
+    }
+
+    assert!(
+        hnsw.layers() <= 65,
+        "runtime: an extreme level scale produced {} layers; the cap is not \
+         applied on this index",
+        hnsw.layers()
+    );
+}
+
+#[test]
+fn runtime_level_cap_does_not_bind_on_a_normal_index() {
+    let normal = build_runtime(Params::new());
+    assert!(
+        normal.layers() < 65,
+        "runtime: a default index already reaches {} layers, so the cap is \
+         reshaping normal graphs",
         normal.layers()
     );
 }
