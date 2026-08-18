@@ -458,7 +458,11 @@ where
         // deleted node still reaches the live nodes behind it.
         searcher.nearest.retain(|n| !self.is_deleted(n.index));
 
-        self.search_zero_layer(q, searcher, cap);
+        // Best-first, matching `Hnsw::search_layer`. The insert path above still
+        // uses the depth-first `search_zero_layer`, deliberately: changing that
+        // would alter graph CONSTRUCTION and therefore every serialized graph,
+        // which is a different change from improving query traversal.
+        self.search_zero_layer_best_first(q, searcher, cap, &|_| true);
 
         let found = core::cmp::min(dest.len(), searcher.nearest.len());
         dest[..found].copy_from_slice(&searcher.nearest[..found]);
