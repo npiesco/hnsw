@@ -722,3 +722,76 @@ where
         Self::new(Met::default(), 12, 24)
     }
 }
+
+#[cfg(test)]
+mod filtered_tie_tests {
+    //! Runtime mirror of `Hnsw`'s `filtered_tie_tests`. This index carries its
+    //! own copy of the rejected-node beam gate, so the tie behaviour has to be
+    //! asserted here too or half of it is unpinned.
+    //!
+    //! ```text
+    //! node 0  seed, accepted   d=10  --> {1, 2}
+    //! node 1  accepted         d=1   --> {}
+    //! node 2  REJECTED         d=1   --> {3}      exactly ties node 1
+    //! node 3  accepted         d=0   --> {}       reachable only through node 2
+    //! ```
+
+    use super::*;
+    use crate::Params;
+    use rand_pcg::Pcg64;
+    use space::{Metric, Neighbor};
+
+    struct Abs;
+
+    impl Metric<f32> for Abs {
+        type Unit = u64;
+        fn distance(&self, a: &f32, b: &f32) -> u64 {
+            (a - b).abs() as u64
+        }
+    }
+
+    fn graph() -> HnswRuntime<Abs, f32, Pcg64> {
+        HnswRuntime {
+            metric: Abs,
+            m: 2,
+            m0: 4,
+            zero: vec![
+                vec![1, 2, EMPTY, EMPTY],
+                vec![EMPTY; 4],
+                vec![3, EMPTY, EMPTY, EMPTY],
+                vec![EMPTY; 4],
+            ],
+            features: vec![10.0f32, 1.0, 1.0, 0.0],
+            layers: Vec::new(),
+            prng: Pcg64::new(0, 0),
+            params: Params::new(),
+            deleted: vec![false; 4],
+            _marker: PhantomData,
+        }
+    }
+
+    #[test]
+    fn a_rejected_node_tying_the_beam_boundary_is_not_expanded() {
+        let hnsw = graph();
+        let mut searcher = Searcher::default();
+        let mut dest = vec![
+            Neighbor {
+                index: !0,
+                distance: !0
+            };
+            1
+        ];
+        let got: Vec<usize> = hnsw
+            .nearest_filtered(&0.0f32, 1, &mut searcher, &mut dest, &|id| id != 2)
+            .iter()
+            .map(|n| n.index)
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![1],
+            "runtime: expected the tied-boundary rejected node to be excluded, \
+             leaving node 1; returning node 3 means the tie was expanded"
+        );
+    }
+}
