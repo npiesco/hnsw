@@ -624,16 +624,46 @@ where
                         },
                     );
                 } else if !within_beam {
-                    // Excluded AND outside the beam: not expanded.
+                    // Excluded AND outside the beam: kept out of the frontier.
                     //
-                    // An earlier comment here claimed this could not affect the
-                    // distance-evaluation count and that no work-count test could
-                    // observe it. That was WRONG. Suppressing a frontier push
-                    // removes that node's entire descendant expansion, and every
-                    // descendant costs a distance evaluation. The unfiltered path
-                    // proved it: the same push made unconditionally for tombstones
-                    // pinned work at ~101% of N regardless of deletion density,
-                    // versus 55% once the identical gate was applied.
+                    // For a STRICTLY farther node this bounds the frontier's
+                    // SIZE, not the distance-evaluation count. Measured across
+                    // selectivity (N=4000, dim=64, ef=32), gate versus ablated:
+                    //
+                    //   selectivity   pushes/query      peak frontier     evals/query
+                    //   1 in 10       734.8 / 2505.7    695 / 2435        2751.8 both
+                    //   1 in 50      2381.3 / 3905.7   2274 / 2873        3987.5 both
+                    //
+                    // Evaluation counts are identical in every row; pushes and
+                    // peak frontier are up to 3.4x and 3.5x larger without it.
+                    // The reason removing it costs no work, where the equivalent
+                    // unconditional push on the UNFILTERED path pinned that
+                    // search at ~101% of N: this frontier is a min-heap and this
+                    // loop has an early stop, so a strictly-farther node is
+                    // popped only after `nearest` is full and triggers the break
+                    // before expanding. `search_single_layer` drains a LIFO
+                    // `Vec` with no early termination, so everything pushed
+                    // there IS expanded and does cost evaluations.
+                    //
+                    // The exception is an exact TIE, and there the gate is
+                    // load-bearing for results as well as memory. `!within_beam`
+                    // means `distance >= nearest.last()`, but the early stop
+                    // tests a strict `>`, so a node exactly equal to the current
+                    // worst would be popped AND expanded. Ties essentially never
+                    // occur on a continuous corpus — hence the identical counts
+                    // above — but are ordinary for a discrete metric such as
+                    // Hamming.
+                    //
+                    // Excluding the tie keeps admission symmetric: the branch
+                    // above already excludes an ACCEPTED node at the same
+                    // distance via `if !within_beam { continue; }`, so a
+                    // rejected one is treated identically. That symmetry has a
+                    // real cost, demonstrated by `filtered_tie_tests`: a live
+                    // node sitting behind a tied rejected node is not found, and
+                    // ablating the gate returns that strictly better result.
+                    // The trade is deliberate — `ef` is a budget, and a search
+                    // that expands ties would honour it inconsistently depending
+                    // on whether the tying node passed the predicate.
                     continue;
                 }
 
@@ -1081,6 +1111,98 @@ mod beam_gate_tests {
         assert!(
             !got.contains(&2),
             "the tombstone itself must never be returned as a result; got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod filtered_tie_tests {
+    //! The rejected-node beam gate at a DISTANCE TIE.
+    //!
+    //! `!within_beam` means `distance >= nearest.last()`, but the early stop
+    //! uses a strict `>`. So for a node exactly EQUAL to the current worst the
+    //! two disagree: the gate excludes it, while the early stop would not have
+    //! stopped before expanding it. On a continuous corpus exact ties
+    //! essentially never occur, which is why a 10-level selectivity sweep
+    //! measured byte-identical evaluation counts with and without the gate. For
+    //! a discrete metric such as Hamming, ties are ordinary.
+    //!
+    //! The graph (query at 0.0, distance is absolute difference):
+    //!
+    //! ```text
+    //! node 0  seed, accepted   d=10  --> {1, 2}
+    //! node 1  accepted         d=1   --> {}
+    //! node 2  REJECTED         d=1   --> {3}      exactly ties node 1
+    //! node 3  accepted         d=0   --> {}       reachable only through node 2
+    //! ```
+    //!
+    //! With `ef == 1`, node 1 fills the result set at d=1 and node 2 ties it.
+
+    use super::*;
+    use crate::Params;
+    use rand_pcg::Pcg64;
+    use space::{Metric, Neighbor};
+
+    struct Abs;
+
+    impl Metric<f32> for Abs {
+        type Unit = u64;
+        fn distance(&self, a: &f32, b: &f32) -> u64 {
+            (a - b).abs() as u64
+        }
+    }
+
+    fn graph() -> Hnsw<Abs, f32, Pcg64, 2, 4> {
+        let edges: [[usize; 4]; 4] = [[1, 2, !0, !0], [!0; 4], [3, !0, !0, !0], [!0; 4]];
+        Hnsw {
+            metric: Abs,
+            zero: edges.map(|neighbors| NeighborNodes { neighbors }).to_vec(),
+            features: vec![10.0f32, 1.0, 1.0, 0.0],
+            layers: Vec::new(),
+            prng: Pcg64::new(0, 0),
+            params: Params::new(),
+            deleted: vec![false; 4],
+            _marker: PhantomData,
+        }
+    }
+
+    /// A REJECTED node exactly on the beam boundary is treated the same as an
+    /// ACCEPTED one there: both are excluded.
+    ///
+    /// The admissible branch excludes a tied accepted node via `if !within_beam
+    /// { continue; }`, so excluding a tied rejected node keeps admission
+    /// symmetric. The consequence is visible: node 3 sits behind the tie and is
+    /// not reached, so the result is node 1.
+    ///
+    /// Ablating the gate makes this return node 3 instead — the tie is pushed,
+    /// the strict `>` early stop does not fire on an equal distance, and the
+    /// child is expanded. That is the ONE regime where the gate changes results
+    /// and evaluation counts rather than only frontier size.
+    #[test]
+    fn a_rejected_node_tying_the_beam_boundary_is_not_expanded() {
+        let hnsw = graph();
+        let mut searcher = Searcher::default();
+        let mut dest = vec![
+            Neighbor {
+                index: !0,
+                distance: !0
+            };
+            1
+        ];
+        // Node 2 is the only rejected node.
+        let got: Vec<usize> = hnsw
+            .nearest_filtered(&0.0f32, 1, &mut searcher, &mut dest, &|id| id != 2)
+            .iter()
+            .map(|n| n.index)
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![1],
+            "expected the tied-boundary rejected node to be excluded, leaving \
+             node 1. Returning node 3 means the tie was pushed onto the frontier \
+             and expanded, because the early stop's strict `>` does not fire on \
+             an equal distance"
         );
     }
 }
