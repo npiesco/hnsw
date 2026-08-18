@@ -14,6 +14,18 @@ index was serialized by an earlier version.
 
 ### Fixed
 
+- **The serialized format depended on the writer's pointer width.** An unused
+  neighbour slot is `!0usize` in memory, so it was written as
+  `0xFFFF_FFFF_FFFF_FFFF` by a 64-bit build and `0xFFFF_FFFF` by a 32-bit one.
+  Both directions were broken: a 64-bit-written index FAILED to load on
+  `wasm32` (`invalid value: integer 18446744073709551615, expected usize`),
+  and a 32-bit-written index loaded on 64-bit with each empty slot silently
+  reinterpreted as neighbour index `4294967295`, because the `take_while(|&n| n
+  != !0)` terminator no longer matched. The wire sentinel is now pinned at
+  `u64::MAX` and mapped back to this target's `!0` on read, which leaves 64-bit
+  output byte-identical so existing indexes stay readable.
+  ([#11](https://github.com/npiesco/hnsw/pull/11))
+
 - **A dense cluster could close itself off entirely.** When a neighbor list was
   full, `add_neighbor` kept the nearest `M`. On clustered data every member of a
   cluster is nearer to every other member than to anything outside it, so each
@@ -124,6 +136,13 @@ Stated conditionally, because these do not all apply to every workload:
   equal `ef` and worse per distance evaluation. A consumer that tuned `ef`
   against the old traversal should re-derive it against measured recall rather
   than carrying the old number over.
+
+- **Indexes are portable across pointer widths** as of
+  [#11](https://github.com/npiesco/hnsw/pull/11). 64-bit output is unchanged, so
+  nothing needs re-writing. An index written by a 32-bit build BEFORE that change
+  is the one exception: its empty neighbour slots were recorded as `4294967295`,
+  which is indistinguishable from a real index of that value, so such a file
+  cannot be repaired and must be rebuilt.
 
 ### Testing notes
 
