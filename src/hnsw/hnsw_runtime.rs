@@ -527,6 +527,10 @@ where
         }
     }
 
+    /// Depth-first zero-layer search, used only by the insert path.
+    ///
+    /// Mirrors [`crate::Hnsw::search_zero_layer`], including the reason it is
+    /// still depth-first while queries are not.
     fn search_zero_layer(&self, q: &T, searcher: &mut Searcher<Met::Unit>, cap: usize) {
         self.search_single_layer(q, searcher, Layer::Zero, cap);
     }

@@ -304,7 +304,7 @@ where
         self.search_layer(q, ef, 0, searcher, dest)
     }
 
-    /// Like [`HNSW::nearest`], but only nodes accepted by `filter` may enter the
+    /// Like [`Hnsw::nearest`], but only nodes accepted by `filter` may enter the
     /// result set.
     ///
     /// `filter` is called with zero-layer node ids. The predicate is applied ONLY
@@ -320,10 +320,18 @@ where
     ///
     /// The zero-layer frontier here is a binary min-heap expanded nearest-first,
     /// and the search stops once the closest remaining candidate is farther than
-    /// the worst of a full result set. This is deliberately NOT the depth-first
-    /// frontier the unfiltered path uses: under a selective predicate the result
-    /// heap fills `1/selectivity` times more slowly, and a depth-first frontier
-    /// then wanders the entire graph.
+    /// the worst of a full result set.
+    ///
+    /// The unfiltered query path now uses this same traversal, so the two agree.
+    /// It did not always: this best-first frontier was introduced for the
+    /// filtered case first, because under a selective predicate the result heap
+    /// fills `1/selectivity` times more slowly and the depth-first frontier the
+    /// unfiltered path then used would wander the entire graph. Measuring
+    /// recall against distance evaluations later showed best-first was the better
+    /// traversal unfiltered too, and it was adopted there as well.
+    ///
+    /// The depth-first traversal still exists and is still used — by the INSERT
+    /// path, deliberately. See `Hnsw::search_zero_layer` (private).
     ///
     /// This is a **distance/beam bound, not a hard work bound**. Work still
     /// scales roughly as `ef / selectivity`, which is inherent to filtered ANN —
@@ -349,22 +357,22 @@ where
         self.search_zero_layer_filtered(q, ef, searcher, dest, filter)
     }
 
-    /// Extract the feature for a given item returned by [`HNSW::nearest`].
+    /// Extract the feature for a given item returned by [`Hnsw::nearest`].
     ///
-    /// The `item` must be retrieved from [`HNSW::search_layer`].
+    /// The `item` must be retrieved from [`Hnsw::search_layer`].
     pub fn feature(&self, item: usize) -> &T {
         self.features.get_feature(item)
     }
 
-    /// Extract the feature from a particular level for a given item returned by [`HNSW::search_layer`].
+    /// Extract the feature from a particular level for a given item returned by [`Hnsw::search_layer`].
     pub fn layer_feature(&self, level: usize, item: usize) -> &T {
         self.features.get_feature(self.layer_item_id(level, item))
     }
 
-    /// Retrieve the item ID for a given layer item returned by [`HNSW::search_layer`].
+    /// Retrieve the item ID for a given layer item returned by [`Hnsw::search_layer`].
     ///
-    /// `level` follows the same convention as [`HNSW::search_layer`] and
-    /// [`HNSW::layer_len`]: level `n > 0` is `self.layers[n - 1]`, because level
+    /// `level` follows the same convention as [`Hnsw::search_layer`] and
+    /// [`Hnsw::layer_len`]: level `n > 0` is `self.layers[n - 1]`, because level
     /// `0` is the zero layer, which is not stored in `self.layers` at all.
     /// Indexing `self.layers[level]` here instead panicked for every non-zero
     /// level — the item index belongs to the layer below the one being indexed,
@@ -441,10 +449,10 @@ where
         self.layer_len(level) == 0
     }
 
-    /// Performs the same algorithm as [`HNSW::nearest`], but stops on a particular layer of the network
+    /// Performs the same algorithm as [`Hnsw::nearest`], but stops on a particular layer of the network
     /// and returns the unique index on that layer rather than the item index.
     ///
-    /// If this is passed a `level` of `0`, then this has the exact same functionality as [`HNSW::nearest`]
+    /// If this is passed a `level` of `0`, then this has the exact same functionality as [`Hnsw::nearest`]
     /// since the unique indices at layer `0` are the item indices.
     pub fn search_layer<'a>(
         &self,
@@ -516,7 +524,7 @@ where
         &mut dest[..found]
     }
 
-    /// Zero-layer search with a caller predicate. Backs [`HNSW::nearest_filtered`].
+    /// Zero-layer search with a caller predicate. Backs [`Hnsw::nearest_filtered`].
     ///
     /// Descent through the upper layers is the unfiltered navigation path; only
     /// the zero layer consults the predicate.
@@ -562,19 +570,23 @@ where
 
     /// Best-first zero-layer traversal with a caller predicate.
     ///
-    /// The unfiltered search pops `candidates` LIFO, which is depth-first. That
-    /// is cheap when almost every visited node is admissible, because `nearest`
-    /// saturates immediately and the distance gate clamps the frontier. Under a
-    /// selective predicate `nearest` fills `1/selectivity` times more slowly, so
-    /// the gate stays open and a depth-first frontier wanders the whole graph.
+    /// Every zero-layer QUERY goes through here — filtered and unfiltered alike,
+    /// the latter passing an accept-all predicate. It expands the CLOSEST
+    /// candidate first and stops once the closest remaining candidate is farther
+    /// than the worst accepted result while a full set is held. That is the
+    /// paper's Algorithm 2, and that termination is the standard HNSW heuristic,
+    /// NOT a proof of optimality — a farther graph node can lead to a nearer
+    /// neighbour, which is precisely why this search is approximate. On the
+    /// fixture in `tests/filtered_search.rs` the early stop is worth 52.9% of the
+    /// corpus visited versus 61.3% without it.
     ///
-    /// This restores the bound the way hnswlib does: always expand the CLOSEST
-    /// candidate, and stop once the closest remaining candidate is farther than
-    /// the worst accepted result while a full set is held. That termination is
-    /// the standard HNSW heuristic, NOT a proof of optimality — a farther graph
-    /// node can lead to a nearer neighbour, which is precisely why this search is
-    /// approximate. On the fixture in `tests/filtered_search.rs` the early stop
-    /// is worth 52.9% of the corpus visited versus 61.3% without it.
+    /// It was introduced for the filtered case, where the depth-first traversal
+    /// the unfiltered path then used breaks down: under a selective predicate
+    /// `nearest` fills `1/selectivity` times more slowly, so the distance gate
+    /// stays open and a depth-first frontier wanders the whole graph. Measuring
+    /// recall per distance evaluation subsequently showed best-first also wins
+    /// unfiltered, so the unfiltered query path was moved onto it — see the note
+    /// at the call site in [`Hnsw::search`].
     ///
     /// The frontier is a real binary min-heap rather than a sorted `Vec`, so a
     /// push is O(log n) rather than O(n) element movement. That matters
@@ -583,8 +595,11 @@ where
     /// insertion would degrade quadratically without any change in the number of
     /// distance evaluations.
     ///
-    /// This deliberately does NOT change the unfiltered traversal, which every
-    /// existing caller depends on.
+    /// This deliberately does NOT change the INSERT path, which still uses the
+    /// depth-first [`Hnsw::search_zero_layer`]. Insertion decides which
+    /// neighbours a new node links to, so changing its traversal would change
+    /// the graph every index builds and every previously serialized graph would
+    /// stop matching a freshly built one.
     fn search_zero_layer_best_first<F>(
         &self,
         q: &T,
@@ -653,13 +668,15 @@ where
                     // Evaluation counts are identical in every row; pushes and
                     // peak frontier are up to 3.4x and 3.5x larger without it.
                     // The reason removing it costs no work, where the equivalent
-                    // unconditional push on the UNFILTERED path pinned that
-                    // search at ~101% of N: this frontier is a min-heap and this
-                    // loop has an early stop, so a strictly-farther node is
-                    // popped only after `nearest` is full and triggers the break
-                    // before expanding. `search_single_layer` drains a LIFO
-                    // `Vec` with no early termination, so everything pushed
-                    // there IS expanded and does cost evaluations.
+                    // unconditional push on the then-depth-first UNFILTERED path
+                    // pinned that search at ~101% of N: this frontier is a
+                    // min-heap and this loop has an early stop, so a
+                    // strictly-farther node is popped only after `nearest` is
+                    // full and triggers the break before expanding.
+                    // `search_single_layer` drains a LIFO `Vec` with no early
+                    // termination, so everything pushed there IS expanded and
+                    // does cost evaluations. (That path is now reached only by
+                    // insertion; queries share this function.)
                     //
                     // The exception is an exact TIE, and there the gate is
                     // load-bearing for results as well as memory. `!within_beam`
@@ -772,7 +789,22 @@ where
         }
     }
 
-    /// Greedily finds the approximate nearest neighbors to `q` in the zero layer.
+    /// Greedily finds the approximate nearest neighbors to `q` in the zero layer,
+    /// depth-first.
+    ///
+    /// This drains `Searcher.candidates`, which is a LIFO `Vec`, and has no
+    /// termination check. Queries do NOT use it — they go through
+    /// [`Hnsw::search_zero_layer_best_first`], which is the paper's Algorithm 2
+    /// and reaches higher recall per distance evaluation.
+    ///
+    /// The INSERT path still uses this, deliberately. Insertion decides which
+    /// neighbours a new node links to, so a different traversal here would build
+    /// a different graph, and every previously serialized index would stop
+    /// matching a freshly built one. Note that `tests/runtime_parity.rs` would
+    /// not catch that: it checks the const-generic and runtime indexes against
+    /// EACH OTHER, with no golden reference, so a change applied to both — which
+    /// any change here must be — leaves it green. Changing this is a deliberate
+    /// format decision, not a drop-in improvement.
     fn search_zero_layer(&self, q: &T, searcher: &mut Searcher<Met::Unit>, cap: usize) {
         self.search_single_layer(q, searcher, Layer::Zero, cap);
     }
