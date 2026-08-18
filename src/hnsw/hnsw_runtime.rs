@@ -492,11 +492,18 @@ where
                     // reachable — but it must NEVER enter the result heap nor
                     // consume the `cap` budget, otherwise the result set
                     // under-fills with live neighbors crowded out by tombstones.
+                    // A tombstone remains eligible for TRAVERSAL — but only while
+                    // it falls within the beam, exactly as a live node must. It
+                    // never enters `nearest`. See `Hnsw::search_single_layer` for
+                    // the measurement and for why this is pruning rather than a
+                    // connectivity guarantee.
                     if matches!(layer, Layer::Zero) && self.is_deleted(node_to_visit) {
-                        searcher.candidates.push(Neighbor {
-                            index: neighbor,
-                            distance,
-                        });
+                        if searcher.nearest.partition_point(|n| n.distance <= distance) != cap {
+                            searcher.candidates.push(Neighbor {
+                                index: neighbor,
+                                distance,
+                            });
+                        }
                         continue;
                     }
                     let pos = searcher.nearest.partition_point(|n| n.distance <= distance);
