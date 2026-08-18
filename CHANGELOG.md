@@ -15,16 +15,20 @@ index was serialized by an earlier version.
 ### Fixed
 
 - **The serialized format depended on the writer's pointer width.** An unused
-  neighbour slot is `!0usize` in memory, so it was written as
-  `0xFFFF_FFFF_FFFF_FFFF` by a 64-bit build and `0xFFFF_FFFF` by a 32-bit one.
-  Both directions were broken: a 64-bit-written index FAILED to load on
-  `wasm32` (`invalid value: integer 18446744073709551615, expected usize`),
-  and a 32-bit-written index loaded on 64-bit with each empty slot silently
-  reinterpreted as neighbour index `4294967295`, because the `take_while(|&n| n
-  != !0)` terminator no longer matched. The wire sentinel is now pinned at
-  `u64::MAX` and mapped back to this target's `!0` on read, which leaves 64-bit
-  output byte-identical so existing indexes stay readable.
-  ([#11](https://github.com/npiesco/hnsw/pull/11))
+  neighbour slot is `!0usize` in memory, whose VALUE follows the target:
+  18446744073709551615 on a 64-bit build, 4294967295 on a 32-bit one. Both
+  directions were broken. A 64-bit-written index FAILED to load on `wasm32`
+  (`invalid value: integer 18446744073709551615, expected usize`), and a
+  32-bit-written index loaded on 64-bit with each empty slot silently
+  reinterpreted as neighbour index 4294967295, because the `take_while(|&n| n !=
+  !0)` terminator no longer matched.
+
+  Note this is about the sentinel's VALUE, not the encoded width: `serde` routes
+  `usize` through `serialize_u64`, so bincode always wrote eight bytes on every
+  target. The wire sentinel is now pinned at `u64::MAX`, the legacy 32-bit value
+  is recognised and recovered as empty, and anything that genuinely does not fit
+  the reading target is a clear error. 64-bit output is unchanged, so existing
+  indexes stay readable. ([#11](https://github.com/npiesco/hnsw/pull/11))
 
 - **A dense cluster could close itself off entirely.** When a neighbor list was
   full, `add_neighbor` kept the nearest `M`. On clustered data every member of a
@@ -138,11 +142,16 @@ Stated conditionally, because these do not all apply to every workload:
   than carrying the old number over.
 
 - **Indexes are portable across pointer widths** as of
-  [#11](https://github.com/npiesco/hnsw/pull/11). 64-bit output is unchanged, so
-  nothing needs re-writing. An index written by a 32-bit build BEFORE that change
-  is the one exception: its empty neighbour slots were recorded as `4294967295`,
-  which is indistinguishable from a real index of that value, so such a file
-  cannot be repaired and must be rebuilt.
+  [#11](https://github.com/npiesco/hnsw/pull/11), for the topology this crate
+  owns. 64-bit output is unchanged, so nothing needs re-writing, and an index
+  written by an older 32-bit build is recognised and recovered rather than
+  silently mis-read.
+
+  Scope, stated narrowly: this covers `NeighborNodes`, the only sentinel this
+  crate persists. `Met`, `T`, `R` and `S` are caller-supplied types serialized by
+  their own impls, so the crate cannot promise portability for arbitrary
+  instantiations — a consumer storing width-dependent values in its feature type
+  or metric owns that.
 
 ### Testing notes
 

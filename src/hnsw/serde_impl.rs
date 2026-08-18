@@ -8,35 +8,54 @@ use serde::{
 
 /// Wire value for an unused neighbour slot.
 ///
-/// In memory that slot is `!0usize`, whose width follows the target: it is
-/// `0xFFFF_FFFF_FFFF_FFFF` on a 64-bit build and `0xFFFF_FFFF` on a 32-bit one
-/// such as `wasm32`. Writing the in-memory value directly therefore produces a
-/// file whose meaning depends on the machine that wrote it, in BOTH directions:
+/// In memory that slot is `!0usize`, whose VALUE follows the target: it is
+/// 18446744073709551615 on a 64-bit build and 4294967295 on a 32-bit one such as
+/// `wasm32`. Writing it directly therefore produced a file whose meaning
+/// depended on the machine that wrote it, in BOTH directions:
 ///
 /// * **64-bit writer, 32-bit reader** — deserialization FAILS outright with
 ///   `invalid value: integer 18446744073709551615, expected usize`, because the
-///   value does not fit a 32-bit `usize`. An index built on a server cannot be
-///   opened in a browser at all.
+///   value does not fit a 32-bit `usize`. An index built on a server could not
+///   be opened in a browser at all.
 /// * **32-bit writer, 64-bit reader** — deserialization SUCCEEDS and is wrong.
-///   `4294967295` is perfectly representable as a 64-bit `usize`, so the
+///   4294967295 is perfectly representable as a 64-bit `usize`, so the
 ///   terminator in `get_neighbors`' `take_while(|&n| n != !0)` never matches and
 ///   the slot is treated as a real neighbour index. That is silent graph
 ///   corruption rather than an error.
 ///
-/// Pinning the wire sentinel at `u64::MAX` fixes both. It is also exactly what a
-/// 64-bit build already wrote, so every index serialized by a 64-bit build up to
-/// now stays byte-identical and readable.
+/// Note this is about the sentinel's VALUE, not the encoded width. `serde`
+/// routes `usize` through `serialize_u64`, so bincode wrote eight bytes on every
+/// target and always has; a 32-bit build emitted `FF FF FF FF 00 00 00 00`, not
+/// four bytes. That is asserted by
+/// `tests::a_bare_usize_encodes_as_eight_bytes_on_every_target` rather than
+/// merely claimed here, because the first version of this comment asserted the
+/// width story and was wrong.
+///
+/// Pinning the wire sentinel at `u64::MAX` fixes both directions, and is exactly
+/// what a 64-bit build already wrote, so indexes serialized by a 64-bit build
+/// stay byte-identical and readable.
 const WIRE_EMPTY: u64 = u64::MAX;
+
+/// Value a 32-bit build wrote for an empty slot before `WIRE_EMPTY` existed.
+///
+/// Such a file is only produced by a 32-bit writer, and on that target no graph
+/// can have 2^32 - 1 nodes, so this value can never be a legitimate neighbour
+/// index in it. Treating it as empty therefore recovers those files rather than
+/// silently importing a nonexistent neighbour — which is what a reader that
+/// simply accepted the number would do, and is the more damaging of the two
+/// original failure directions because it does not announce itself.
+const LEGACY_32_BIT_EMPTY: u64 = u32::MAX as u64;
 
 impl<const N: usize> Serialize for NeighborNodes<N> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Elements are written as `u64` rather than `usize` so the encoding does
-        // not depend on the pointer width of the writing machine. On a 64-bit
-        // build this is byte-for-byte what `self.neighbors[..].serialize(..)`
-        // produced before, since `usize` already encodes as `u64` there.
+        // Elements are written as `u64` for clarity, but the load-bearing part
+        // is mapping the in-memory sentinel onto a FIXED wire value. `serde`
+        // already routes `usize` through `serialize_u64`, so the encoded WIDTH
+        // was never the problem — see
+        // `tests::a_bare_usize_encodes_as_eight_bytes_on_every_target`.
         let mut seq = serializer.serialize_seq(Some(N))?;
         for &n in &self.neighbors {
             let wire = if n == !0 { WIRE_EMPTY } else { n as u64 };
@@ -71,12 +90,11 @@ impl<'de, const N: usize> Visitor<'de> for NeighborNodesVisitor<N> {
         let mut neighbors = [!0; N];
         let mut position = 0;
 
-        // Read as `u64` for the reason given on `WIRE_EMPTY`. Reading as `usize`
-        // is what made a 32-bit reader reject the sentinel a 64-bit writer had
-        // produced, which is the whole defect.
+        // Read as `u64` and canonicalize the sentinel. Reading as `usize` is
+        // what made a 32-bit reader reject the value a 64-bit writer produced.
         while let Some(n) = seq.next_element::<u64>()? {
             if position < N {
-                neighbors[position] = if n == WIRE_EMPTY {
+                neighbors[position] = if n == WIRE_EMPTY || n == LEGACY_32_BIT_EMPTY {
                     !0
                 } else {
                     usize::try_from(n).map_err(|_| {
@@ -132,15 +150,44 @@ mod tests {
             .with_fixint_encoding()
     }
 
+    /// Settles what the encoding width of a bare `usize` actually is.
+    ///
+    /// This exists because I originally described the defect as `usize` being
+    /// written four bytes wide on a 32-bit target. That was WRONG. `serde`'s
+    /// `impl Serialize for usize` forwards to `serialize_u64`, so bincode writes
+    /// eight bytes on every target and always has. The old encoding of an empty
+    /// slot on 32-bit was `FF FF FF FF 00 00 00 00` — eight bytes carrying the
+    /// value 4294967295 — not four bytes.
+    ///
+    /// The defect is therefore VALUE canonicalization, not integer width: the
+    /// sentinel's numeric value tracked the writer's pointer width even though
+    /// its encoded width did not. Writing `u64` explicitly is clarity; mapping
+    /// `!0usize` to `u64::MAX` is the actual fix.
+    ///
+    /// Asserted rather than asserted-in-prose so the claim is checked on
+    /// whichever target the suite runs on.
+    #[test]
+    fn a_bare_usize_encodes_as_eight_bytes_on_every_target() {
+        let one: usize = 1;
+        let bytes = options().serialize(&one).expect("serialize");
+        assert_eq!(
+            bytes.len(),
+            8,
+            "bincode fixint must encode `usize` as eight bytes; got {bytes:?} on \
+             a target with usize::BITS = {}",
+            usize::BITS
+        );
+        assert_eq!(bytes, 1u64.to_le_bytes());
+    }
+
     /// The encoding is pinned to an EXACT byte sequence rather than checked by
     /// round trip, because a round trip cannot see this defect: it is symmetric
-    /// on any single target and only breaks when the writer and reader have
-    /// different pointer widths.
+    /// on any single target and only breaks when the writer and reader disagree
+    /// about what an empty slot's VALUE is.
     ///
-    /// On a 64-bit build this is what was already written, so the format is
-    /// unchanged and existing indexes stay readable. On `wasm32` the previous
-    /// code emitted four-byte elements and a four-byte sentinel, producing 24
-    /// bytes here instead of 40 — an incompatible file.
+    /// Before the fix this produced the same 40 bytes on 64-bit — the format is
+    /// unchanged there — but on a 32-bit target the first element was
+    /// `FF FF FF FF 00 00 00 00` (4294967295) rather than `FF * 8`.
     #[test]
     fn a_neighbour_list_encodes_as_length_prefixed_u64s() {
         let nodes = NeighborNodes::<4> {
@@ -177,6 +224,34 @@ mod tests {
 
         assert_eq!(nodes.neighbors[0], !0, "sentinel must decode to !0");
         assert_eq!(nodes.neighbors[1], 3, "real index must decode unchanged");
+        assert_eq!(nodes.neighbors[2], !0);
+        assert_eq!(nodes.neighbors[3], !0);
+    }
+
+    /// A file written by a 32-bit build BEFORE the sentinel was canonicalized
+    /// must be recovered rather than silently importing a phantom neighbour.
+    ///
+    /// This is the direction that fails quietly: 4294967295 is a representable
+    /// 64-bit `usize`, so a reader that simply accepted it would hand back a
+    /// neighbour index no node has, and `take_while(|&n| n != !0)` would not
+    /// stop there.
+    #[test]
+    fn a_legacy_32_bit_empty_slot_is_recovered_as_empty() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&(u32::MAX as u64).to_le_bytes());
+        bytes.extend_from_slice(&(u32::MAX as u64).to_le_bytes());
+        bytes.extend_from_slice(&(u32::MAX as u64).to_le_bytes());
+
+        let nodes: NeighborNodes<4> = options().deserialize(&bytes).expect("deserialize");
+
+        assert_eq!(nodes.neighbors[0], 2, "a real index must survive");
+        assert_eq!(
+            nodes.neighbors[1], !0,
+            "a legacy 32-bit sentinel must be recovered as empty, not imported \
+             as neighbour index 4294967295"
+        );
         assert_eq!(nodes.neighbors[2], !0);
         assert_eq!(nodes.neighbors[3], !0);
     }
