@@ -147,6 +147,12 @@ Stated conditionally, because these do not all apply to every workload:
   written by an older 32-bit build is recognised and recovered rather than
   silently mis-read.
 
+  "Unchanged" is measured rather than argued: `examples/dump_serialized.rs`
+  serializes a fixed seeded index and prints a length and digest, and it reports
+  the same values on the commit before the change and after it — 49,760 bytes /
+  `2097de0ca22b2883` under fixint, and 11,948 bytes / `6e99623aac50911c` under
+  the default varint encoding, which is the one consumers actually use.
+
   Scope, stated narrowly: this covers `NeighborNodes`, the only sentinel this
   crate persists. `Met`, `T`, `R` and `S` are caller-supplied types serialized by
   their own impls, so the crate cannot promise portability for arbitrary
