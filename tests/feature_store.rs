@@ -25,6 +25,21 @@
 //! so any divergence in graph construction surfaces as a different ranked list
 //! rather than as a passing test.
 
+//! ## Why this is native-only
+//!
+//! Every test here is backed by `memmap2` over a real file, and a memory mapping
+//! is a capability WASI does not provide — there is no `mmap` to call. The file
+//! is gated rather than adapted because the thing under test genuinely does not
+//! exist on that target, not because it was inconvenient to run: `store_path`
+//! also reaches for `std::env::temp_dir()`, which is an unsupported stub that
+//! panics under `wasm32-wasip2`.
+//!
+//! The borrow-stability contract itself is not wasm-specific and is exercised on
+//! every target through the default `Vec<T>` store used by the rest of the
+//! suite.
+
+#![cfg(not(target_family = "wasm"))]
+
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 

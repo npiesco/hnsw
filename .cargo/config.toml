@@ -1,2 +1,19 @@
-[build]
+# `target-cpu=native` is scoped to the host triples rather than `[build]`.
+# Under `[build]` it is passed to EVERY target, including `wasm32-*`, where
+# `native` is not a valid CPU and the build fails outright. Scoping it is what
+# lets the suite run on `wasm32-wasip2`, which is the only way this crate can
+# observe a 32-bit `usize` — see `tests/serde_pointer_width.rs`.
+[target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.wasm32-wasip2]
+runner = ["wasmtime"]

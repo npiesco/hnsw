@@ -1,0 +1,35 @@
+# Runs the suite on a 32-bit target.
+#
+# This exists because the pointer-width defect in `NeighborNodes`' serde impl was
+# invisible to every 64-bit test: the in-memory sentinel and the wire sentinel
+# coincide there, so a round trip passes before and after. Only a reader of a
+# DIFFERENT width can observe it, and until this workflow there was none — the
+# fix could have been reverted with CI still green.
+#
+# `wasm32-wasip2` is the cheapest real 32-bit target: `usize` is 32 bits and
+# wasmtime runs the harness directly. It is NOT browser coverage — that is
+# `wasm32-unknown-unknown`, which needs a JS host and is exercised by the
+# consumer rather than here.
+
+on: [push, pull_request]
+
+name: 32-bit
+
+jobs:
+  wasip2:
+    name: Test on wasm32-wasip2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-wasip2
+
+      - name: Install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+
+      - name: Run cargo test
+        run: cargo test --target wasm32-wasip2 --features serde1
