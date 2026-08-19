@@ -46,8 +46,10 @@ fn live_neighbors(slice: &[usize]) -> impl Iterator<Item = usize> + '_ {
 /// supported with no fixed set of allowed values.
 ///
 /// Given the SAME `(m, m0)`, the SAME seeded PRNG, and the SAME insertion order,
-/// this produces byte-identical construction + search results to
-/// `Hnsw<_, _, _, M, M0>`; see `tests/runtime_parity.rs`.
+/// this returns identical search results to `Hnsw<_, _, _, M, M0>`; see
+/// `tests/runtime_parity.rs`, which compares ranked results and `len()` — it
+/// does not inspect construction or any serialized form, and it compares the two
+/// implementations only against each other.
 #[derive(Clone)]
 pub struct HnswRuntime<Met, T, R, S = Vec<T>> {
     metric: Met,
@@ -527,6 +529,10 @@ where
         }
     }
 
+    /// Depth-first zero-layer search, used only by the insert path.
+    ///
+    /// Mirrors [`crate::Hnsw::search_zero_layer`], including the reason it is
+    /// still depth-first while queries are not.
     fn search_zero_layer(&self, q: &T, searcher: &mut Searcher<Met::Unit>, cap: usize) {
         self.search_single_layer(q, searcher, Layer::Zero, cap);
     }
@@ -622,9 +628,11 @@ where
 
     /// Mirrors [`crate::Hnsw::add_neighbor`], including its neighbor selection
     /// heuristic. The two must stay identical: `tests/runtime_parity.rs` holds
-    /// this index byte-identical to the const-generic one for the same degrees,
-    /// seed, and insertion order, and neighbor pruning is part of what it
-    /// compares.
+    /// this index's SEARCH RESULTS identical to the const-generic one's for the
+    /// same degrees, seed, and insertion order, and neighbor pruning shapes the
+    /// graph those results come from. Note that test compares the two
+    /// implementations only against each other, so a divergence introduced into
+    /// both at once would not show up there.
     fn add_neighbor(&mut self, q: &T, node_ix: usize, target_ix: usize, layer: usize) {
         let capacity = if layer == 0 { self.m0 } else { self.m };
 

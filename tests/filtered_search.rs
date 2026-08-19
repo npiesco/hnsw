@@ -353,22 +353,33 @@ fn filtered_search_does_not_degenerate_to_a_full_scan() {
     );
 }
 
-/// A predicate that accepts everything must not make the search WORSE than no
-/// predicate at all.
+/// A predicate that accepts everything must return EXACTLY what no predicate
+/// returns.
 ///
-/// This deliberately does NOT assert byte equality with unfiltered search. The
-/// filtered path uses a best-first frontier with an early stop while the
+/// This asserts full equality of the ranked result lists, which became a real
+/// contract rather than an accident once the unfiltered zero-layer query moved
+/// to best-first. Both paths now run the same sequence: `initialize_searcher`,
+/// an unfiltered descent through the upper layers at `cap = 1`, the tombstone
+/// scrub, then `search_zero_layer_best_first` with the same `ef` — one passing
+/// the caller's predicate, the other an accept-all closure. With an accept-all
+/// predicate those are the same computation, so any divergence means the two
+/// entry points have drifted apart and one of them is doing something the other
+/// is not.
+///
+/// An earlier revision deliberately did NOT assert this, on the grounds that
+/// "the filtered path uses a best-first frontier with an early stop while the
 /// unfiltered path is depth-first, so they are different algorithms and any
-/// byte-for-byte agreement is incidental to the fixture rather than a contract.
-/// Asserting equality would pin an accident and would fail on a legitimate
-/// improvement to either path.
+/// byte-for-byte agreement is incidental to the fixture". That was true when
+/// written. It stopped being true when queries moved to best-first, and the
+/// weaker `recall > 0.5` check it left behind would pass even if the filtered
+/// path silently lost half its results.
 ///
-/// What IS a contract: accept-all must fill the result set.
-///
-/// What is NOT: recall parity at equal `ef`. An earlier revision asserted
-/// `all_r >= plain_r - 0.01`, which is FALSE and passed only because this
+/// What is still NOT a contract: recall parity at equal `ef` between this
+/// fixture and some other traversal. An earlier revision asserted
+/// `all_r >= plain_r - 0.01`, which was FALSE and passed only because this
 /// fixture's `DIM = 8` saturates recall at 1.0 for both paths. Measured on a
-/// non-saturating corpus (dim=64, N=4000, k=10):
+/// non-saturating corpus (dim=64, N=4000, k=10) against the OLD depth-first
+/// unfiltered path:
 ///
 /// | ef | plain evals | plain recall | filtered evals | filtered recall |
 /// | -- | ----------- | ------------ | -------------- | --------------- |
@@ -376,20 +387,15 @@ fn filtered_search_does_not_degenerate_to_a_full_scan() {
 /// | 32 | 1894.7      | 0.9617       | 707.3          | 0.7933          |
 /// | 64 | 2669.7      | 0.9933       | 1143.7         | 0.9217          |
 ///
-/// The filtered path recalls materially WORSE at every equal `ef` — by 0.17 at
-/// ef=32, seventeen times the old 0.01 budget. That is not a defect: `ef` is
-/// result-list capacity, not an expansion budget, and the two paths spend it
-/// differently. The LIFO path has no pop-time termination, so it keeps expanding
-/// stale candidates admitted under an earlier, wider beam; it buys its extra
-/// recall with roughly 2.6x the work.
-///
-/// Normalised for work, best-first wins: filtered at ef=64 achieves 0.9217
-/// recall for 1143.7 evaluations, against 0.8650 for 1190.4 on the plain path.
-/// So the honest contract is a Pareto one, asserted below, rather than a
-/// same-`ef` comparison that only held because the fixture could not tell the
-/// two apart.
+/// The best-first path recalled materially worse at every equal `ef` — by 0.17
+/// at ef=32, seventeen times the old 0.01 budget — because `ef` is result-list
+/// capacity rather than an expansion budget, and the depth-first path bought its
+/// extra recall with roughly 2.6x the work. That measurement is what moved the
+/// unfiltered path onto best-first, and it is retained here because it explains
+/// why a same-`ef` recall comparison between DIFFERENT traversals is not a
+/// contract even though an equality comparison between the SAME traversal is.
 #[test]
-fn accept_all_predicate_fills_the_result_set() {
+fn accept_all_predicate_matches_unfiltered_search() {
     for seed in [2u64, 5, 11] {
         let features = corpus(seed);
         let hnsw = build(&features);
@@ -417,6 +423,13 @@ fn accept_all_predicate_fills_the_result_set() {
                 .to_vec();
 
             assert_eq!(all.len(), K, "accept-all filtered search under-filled");
+            assert_eq!(
+                all, plain,
+                "seed {seed}: an accept-all predicate must return exactly what \
+                 unfiltered search returns — both entry points run the same \
+                 descent and the same `search_zero_layer_best_first` at the same \
+                 `ef`, so a divergence means they have drifted apart"
+            );
 
             let mut s3 = Searcher::default();
             let mut d3 = dest(K);
@@ -432,6 +445,11 @@ fn accept_all_predicate_fills_the_result_set() {
                 rt_all.len(),
                 K,
                 "runtime accept-all filtered search under-filled"
+            );
+            assert_eq!(
+                rt_all, rt_plain,
+                "seed {seed}: the runtime index must show the same accept-all \
+                 equality as the const-generic one"
             );
 
             plain_hits += plain.iter().filter(|n| truth.contains(&n.index)).count();
@@ -450,10 +468,10 @@ fn accept_all_predicate_fills_the_result_set() {
             rt_all_hits as f64 / total as f64,
         );
 
-        // Recall is recorded for both paths but NOT compared at equal `ef`; see
-        // the doc comment for the measurement showing that comparison is false
-        // on a non-saturating corpus. What must hold is that accept-all filtering
-        // still returns useful results rather than degenerating.
+        // Recall is recorded for both paths but NOT compared at equal `ef`
+        // against a different traversal; see the doc comment. The contract that
+        // does hold is exact equality between the two entry points, asserted
+        // per-query above.
         assert!(
             all_r > 0.5,
             "seed {}: accept-all filtered recall collapsed to {:.4}; the predicate \

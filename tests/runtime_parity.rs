@@ -1,17 +1,29 @@
-//! Behavioral-parity guard: the runtime-degree `HnswRuntime` MUST produce
-//! byte-identical construction + search results to the const-generic
-//! `Hnsw<_, _, _, M, M0>` when configured with the SAME `(M, M0)`, the SAME
-//! seeded PRNG, and the SAME insertion order.
+//! Behavioral-parity guard: the runtime-degree `HnswRuntime` MUST return
+//! identical search results to the const-generic `Hnsw<_, _, _, M, M0>` when
+//! configured with the SAME `(M, M0)`, the SAME seeded PRNG, and the SAME
+//! insertion order.
 //!
 //! ## Why this is a real behavioral test (not a tripwire)
 //!
 //! Both indexes are driven through their REAL `insert`/`nearest` paths over an
 //! identical seeded corpus. The HNSW graph is fully deterministic given a fixed
 //! PRNG sequence + insertion order + neighbor-selection tie-breaks, so a
-//! faithful runtime mirror of the const-generic algorithm yields byte-identical
-//! `Neighbor { index, distance }` sequences for every query. Any divergence in
-//! level assignment, neighbor pruning, layer descent, or tie-breaking makes the
-//! search results differ and this test fails RED for that real runtime reason.
+//! faithful runtime mirror of the const-generic algorithm yields identical
+//! `Neighbor { index, distance }` sequences for every query. A divergence in
+//! level assignment, neighbor pruning, layer descent, or tie-breaking changes
+//! the graph, and on this corpus that shows up as differing results.
+//!
+//! ## What this does NOT check
+//!
+//! Construction is only observed INDIRECTLY, through query results and `len()`.
+//! Nothing here inspects the graph or any serialized form, so a construction
+//! change that happens to preserve the ranked results on this fixture would pass.
+//!
+//! More importantly, this compares the two implementations against EACH OTHER
+//! rather than against a golden reference. A change applied to both — which any
+//! change to shared insert behaviour must be — leaves this test green by
+//! construction. It guards the runtime mirror against drifting from the
+//! const-generic original; it does not pin either one's graph format.
 //!
 //! This is the guard that lets immutlex swap the const-generic chunk index's
 //! degrees for an operator-configured runtime `M` on the transient doc-mean
@@ -76,7 +88,7 @@ fn build_runtime(features: &[Vec<f32>]) -> HnswRuntime<Euclidean, Vec<f32>, Pcg6
 }
 
 #[test]
-fn runtime_degree_hnsw_matches_const_generic_byte_for_byte() {
+fn runtime_degree_hnsw_matches_const_generic_search_results() {
     let features = corpus();
     let cst = build_const(&features);
     let rt = build_runtime(&features);
@@ -85,7 +97,7 @@ fn runtime_degree_hnsw_matches_const_generic_byte_for_byte() {
     assert_eq!(cst.len(), N);
 
     // Query with every corpus point plus some fresh random probes; assert the
-    // full ranked neighbor list is byte-identical between the two indexes.
+    // full ranked neighbor list is identical between the two indexes.
     let mut probe_rng = Pcg64::seed_from_u64(7);
     let probes: Vec<Vec<f32>> = features
         .iter()

@@ -1,3 +1,15 @@
+# Formatting, lints, and documentation.
+#
+# The docs job exists because ten intra-doc links referencing `HNSW::` (the type
+# is `Hnsw`) sat broken in this crate with nothing to catch them. The crate sets
+# `-D warnings`, which promotes `rustdoc::broken_intra_doc_links` to a hard
+# error — but `cargo doc` was never run anywhere, so the lint only fired if
+# someone happened to build docs by hand. A lint nothing runs is not enforced.
+#
+# Clippy runs with `--all-targets --all-features` rather than bare, so tests,
+# benches, and feature-gated code are linted too. The bare form skipped all of
+# them.
+
 on: [push, pull_request]
 
 name: lints
@@ -8,24 +20,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install nightly toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          profile: minimal
-          toolchain: nightly
-          override: true
           components: rustfmt, clippy
 
       - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy --all-targets --all-features
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
