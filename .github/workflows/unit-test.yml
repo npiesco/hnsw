@@ -30,3 +30,29 @@ jobs:
 
       - name: Run cargo test
         run: cargo test --all-features
+
+  # Every other job in this repository passes `--all-features`, so the DEFAULT
+  # feature set was never built by CI at all. An example that used `serde`
+  # without a `required-features` gate therefore broke a plain `cargo test` for
+  # anyone who cloned the repo, while CI stayed green. This job is the one that
+  # would have caught it.
+  default-features:
+    name: Default features
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Run cargo test with default features
+        # Two commands, deliberately. `cargo check --all-targets` compiles
+        # examples and benches without running them — that is what catches an
+        # example missing a `required-features` gate. `cargo test` then runs the
+        # actual tests. `cargo test --all-targets` is NOT used: it executes the
+        # benches, which read a descriptor file that is not in the repository and
+        # panic.
+        run: |
+          cargo check --all-targets
+          cargo test
