@@ -18,6 +18,13 @@ serde1 = ["serde"]
 name = "benches"
 harness = false
 
+# `dump_serialized` exists to diff serialized output across commits, so it uses
+# `serde` unconditionally. Without this gate a plain `cargo test` — no features —
+# tries to build it and fails to compile the whole example target.
+[[example]]
+name = "dump_serialized"
+required-features = ["serde1"]
+
 [dependencies]
 space = { version = "0.17.0", default-features = false, features = ["alloc"] }
 rand_core = "0.6.3"
